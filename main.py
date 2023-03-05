@@ -36,16 +36,14 @@ def get_args_parser():
 
 
 def main(args):
-    utils.init_distributed_mode(args)
     cfg = SLConfig.fromfile(args.config_file)
-    if args.options is not None:
-        cfg.merge_from_dict(args.options)
     cfg_dict = cfg._cfg_dict.to_dict()
     args_vars = vars(args)
     for k,v in cfg_dict.items():
         if k not in args_vars:
             setattr(args, k, v)
 
+    utils.init_distributed_mode(args)
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -67,8 +65,8 @@ def main(args):
     param_dicts = get_param_dict(args, model_without_ddp)
 
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
-    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_drop_list)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+    # lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_drop_list)
 
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
@@ -97,7 +95,7 @@ def main(args):
         checkpoint = torch.load(args.pretrained, map_location='cpu')
         model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
     if args.eval:
-        evaluate(args.dataset_file, model, postprocessors, data_loader_val, args.subject_category_id, device)
+        evaluate(args.dataset_file, model, postprocessors, data_loader_val, device, args)
         return
 
     print("Start training")
@@ -120,11 +118,10 @@ def main(args):
                                       'epoch': epoch}, checkpoint_path)
 
         if (epoch + 1) % args.eval_interval == 0:
-            test_stats = evaluate(args.dataset_file, model, postprocessors, data_loader_val, args.subject_category_id, device)
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         **{f'test_{k}': v for k, v in test_stats.items()},
-                         'epoch': epoch,
-                         'n_parameters': n_parameters}
+            test_stats = evaluate(args.dataset_file, model, postprocessors, data_loader_val, device, args)
+            log_stats = {'epoch': epoch + 1,
+                         **{f'train_{k}': v for k, v in train_stats.items()},
+                         **{f'test_{k}': v for k, v in test_stats.items()}}
 
             epoch_time = time.time() - epoch_start_time
             epoch_time_str = str(datetime.timedelta(seconds=int(epoch_time)))

@@ -20,6 +20,7 @@ from torch import nn, Tensor
 from util.misc import inverse_sigmoid
 from .utils import gen_encoder_output_proposals, MLP,_get_activation_fn, gen_sineembed_for_position
 from .ops.modules import MSDeformAttn
+from util.box_ops import box_union, compute_spatial_feature
 
 
 class DeformableTransformer(nn.Module):
@@ -45,6 +46,10 @@ class DeformableTransformer(nn.Module):
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))  # for lvl_pos_embed
         self.tgt_embed = nn.Embedding(self.num_queries, d_model)  # decoder embedding
         nn.init.normal_(self.tgt_embed.weight.data)
+        self.sub_tgt_embed = nn.Embedding(self.num_queries, d_model)  # decoder embedding
+        nn.init.normal_(self.sub_tgt_embed.weight.data)
+        self.hoi_tgt_embed = nn.Embedding(self.num_queries, d_model)  # decoder embedding
+        nn.init.normal_(self.hoi_tgt_embed.weight.data)
 
         # anchor selection at the output of encoder
         self.enc_output = nn.Linear(d_model, d_model)
@@ -52,6 +57,8 @@ class DeformableTransformer(nn.Module):
 
         self.enc_out_class_embed = None
         self.enc_out_bbox_embed = None
+        self.enc_out_sub_class_embed = None
+        self.enc_out_sub_bbox_embed = None
 
         self._reset_parameters()
 
@@ -74,7 +81,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, refpoint_embed, pos_embeds, tgt, attn_mask=None):
+    def forward(self, srcs, masks, poss, tgt, sub_tgt, hoi_tgt, refpoint_embed, sub_refpoint_embed, attn_mask=None):
         """
         Input:
             - srcs: List of multi features [bs, ci, hi, wi]
@@ -89,7 +96,7 @@ class DeformableTransformer(nn.Module):
         mask_flatten = []
         lvl_pos_embed_flatten = []
         spatial_shapes = []
-        for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
+        for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, poss)):
             bs, c, h, w = src.shape
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
@@ -119,43 +126,54 @@ class DeformableTransformer(nn.Module):
         output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)  # (bs, sum(hi*wi), d_model) (bs, sum(hi*wi), 4)
         output_memory = self.enc_output_norm(self.enc_output(output_memory))  # (bs, sum(hi*wi), d_model)
 
+        # for select topK proposals
         enc_outputs_class_unselected = self.enc_out_class_embed(output_memory)  # (bs, sum(hi*wi), 80)
-        enc_outputs_coord_unselected = self.enc_out_bbox_embed(output_memory) + output_proposals  # (bs, sum{hi*wi}, 4) unsigmoid
-        topk = self.num_queries  # 900
-        topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1] # bs, nq
+        topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], self.num_queries, dim=1)[1]  # bs, nq
+
+        # for reduce calculation, select first and then calculate
+        memory_proposals = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))  # (bs, nq, d_model)
+        box_proposal = torch.gather(output_proposals, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # (bs, nq, 4) unsigmoid
 
         # gather boxes: Dynamic_Anchors
-        refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # (bs, nq, 4) unsigmoid
-        refpoint_embed_ = refpoint_embed_undetach.detach()    # (bs, nq, 4) unsigmoid
-        # init_box_proposal = torch.gather(output_proposals, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)).sigmoid() # sigmoid
-        init_box_proposal = torch.gather(output_proposals, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # (bs, nq, 4) unsigmoid
+        refpoint_embed_undetach = self.enc_out_bbox_embed(memory_proposals) + box_proposal  # (bs, nq, 4) unsigmoid
+        refpoint_embed_ = refpoint_embed_undetach.detach()  # (bs, nq, 4) unsigmoid
+        sub_refpoint_embed_undetach = self.enc_out_sub_bbox_embed(memory_proposals) + box_proposal  # (bs, nq, 4) unsigmoid
+        sub_refpoint_embed_ = sub_refpoint_embed_undetach.detach()  # (bs, nq, 4) unsigmoid
+
+        interm_class = self.enc_out_class_embed(memory_proposals)  # (bs, nq, num_obj_classes)
+        interm_verb_class = self.enc_out_verb_class_embed(memory_proposals)  # (bs, nq, num_verb_classes)
 
         # gather tgt: Static_Content_Queries
-        tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))  # (bs, nq, d_model)
         tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # bs, nq, d_model
+        sub_tgt_ = self.sub_tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # TODO for human init content
+        hoi_tgt_ = self.hoi_tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # TODO for hoi init content
 
-        if refpoint_embed is not None and tgt is not None:  # for DN
+        if refpoint_embed is not None:  # for DN
             refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_], dim=1)  # (bs, dn+nq, 4) unsigmoid
             tgt = torch.cat([tgt, tgt_], dim=1)  # (bs, dn+nq, d_model)
+            sub_refpoint_embed = torch.cat([sub_refpoint_embed, sub_refpoint_embed_], dim=1)  # TODO for concat human bbox unsigmoid
+            sub_tgt = torch.cat([sub_tgt, sub_tgt_], dim=1)  # TODO for concat human init content
+            hoi_tgt = torch.cat([hoi_tgt, hoi_tgt_], dim=1)  # TODO for concat hoi init content
         else:
             refpoint_embed, tgt = refpoint_embed_, tgt_
+            sub_refpoint_embed, sub_tgt, hoi_tgt = sub_refpoint_embed_, sub_tgt_, hoi_tgt_  # TODO for concat human & hoi init content
 
         # Decoder
-        hs, references = self.decoder(  # (n_dec, bs, nq, d_model)    (n_dec+1, bs, bq, 4) sigmoid
+        h_hs, h_ref, o_hs, o_ref, hoi = self.decoder(  # (n_dec, bs, nq, d_model)    (n_dec+1, bs, bq, 4) sigmoid
                 tgt=tgt.transpose(0, 1),  # dn+nq, bs, d_model
+                sub_tgt=sub_tgt.transpose(0, 1),  # TODO for human content
+                hoi=hoi_tgt.transpose(0, 1),  # TODO for hoi content
                 memory=memory.transpose(0, 1),  # sum(hi*wi), bs, d_model
                 memory_key_padding_mask=mask_flatten,  # bs, sum(hi*wi)  MASK
                 refpoints_unsigmoid=refpoint_embed.transpose(0, 1),  # dn+nq, bs, 4
+                sub_refpoints_unsigmoid=sub_refpoint_embed.transpose(0, 1),  # TODO for human bbox
                 level_start_index=level_start_index,  # num_levels
                 spatial_shapes=spatial_shapes,  # num_levels, 2
                 valid_ratios=valid_ratios,  # bs, num_levels, 2
                 tgt_mask=attn_mask)  # (dn+nq, dn+nq)
 
-        # PostProcess
-        hs_enc = tgt_undetach.unsqueeze(0)  # hs_enc: (1, bs, nq, d_model)
-        ref_enc = refpoint_embed_undetach.sigmoid().unsqueeze(0)  # ref_enc: sigmoid coordinates.(1, bs, nq, query_dim)
-
-        return hs, references, hs_enc, ref_enc, init_box_proposal
+        return h_hs, h_ref, o_hs, o_ref, hoi, interm_class, interm_verb_class, \
+               refpoint_embed_undetach.sigmoid(), sub_refpoint_embed_undetach.sigmoid()
 
 
 class TransformerEncoder(nn.Module):
@@ -209,23 +227,32 @@ class TransformerDecoder(nn.Module):
 
     def __init__(self, decoder_layer, num_layers, d_model=256, query_dim=4, dec_layer_share=False):
         super().__init__()
+
         self.layers = _get_clones(decoder_layer, num_layers, layer_share=dec_layer_share)
-        self.norm = nn.LayerNorm(d_model)
-        # self.query_dim = query_dim
+        self.sub_layers = _get_clones(decoder_layer, num_layers, layer_share=dec_layer_share)
+        self.hoi_layers = _get_clones(decoder_layer, num_layers, layer_share=dec_layer_share)
+
+        self.norm, self.sub_norm, self.hoi_norm = nn.LayerNorm(d_model), nn.LayerNorm(d_model), nn.LayerNorm(d_model)
+
         self.ref_point_head = MLP(query_dim // 2 * d_model, d_model, d_model, 2)
+        self.sub_ref_point_head = MLP(query_dim // 2 * d_model, d_model, d_model, 2)
+        # self.hoi_ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
 
-        self.query_scale = None
+        fuser = Fuser(d_model, activation="relu", d_ffn=d_model*8, dropout=0.0)
+        self.fusers = _get_clones(fuser, num_layers, layer_share=False)
+
         self.bbox_embed = None
-        # self.class_embed = None
+        self.sub_bbox_embed = None
 
-    def forward(self, tgt, memory,  # 1100, bs, d_model   # sum(hi*wi), bs, d_model
+    def forward(self, tgt, sub_tgt, hoi, memory,  # 1100, bs, d_model   # sum(hi*wi), bs, d_model
                 tgt_mask: Optional[Tensor] = None,  # dn+nq, dn+nq
                 memory_key_padding_mask: Optional[Tensor] = None,  # bs, sum(hi*wi)
                 refpoints_unsigmoid: Optional[Tensor] = None, # 1100, bs, 4
+                sub_refpoints_unsigmoid: Optional[Tensor] = None,  # 1100, bs, 4
                 # for memory
                 level_start_index: Optional[Tensor] = None,  # num_levels
                 spatial_shapes: Optional[Tensor] = None,  # num_levels, 2
-                valid_ratios: Optional[Tensor] = None, # bs, num_levels, 2
+                valid_ratios: Optional[Tensor] = None,  # bs, num_levels, 2
                 ):
         """
         Input:
@@ -235,50 +262,67 @@ class TransformerDecoder(nn.Module):
             - refpoints_unsigmoid: nq, bs, 2/4
             - valid_ratios/spatial_shapes: bs, nlevel, 2
         """
-        output = tgt
+        output, sub_output, hoi_output = tgt, sub_tgt, hoi
 
-        intermediate = []
-        reference_points = refpoints_unsigmoid.sigmoid()  # dn+nq, bs, 4
-        ref_points = [reference_points]  
+        intermediate, sub_intermediate, hoi_intermediate = [], [], []
+        reference_points, sub_reference_points = refpoints_unsigmoid.sigmoid(), sub_refpoints_unsigmoid.sigmoid()  # dn+nq, bs, 4
+        ref_points, sub_ref_points = [reference_points], [sub_reference_points]
 
-        for layer_id, layer in enumerate(self.layers):
+        for layer_id, (layer, sub_layer, hoi_layer, fuser) in enumerate(zip(self.layers, self.sub_layers, self.hoi_layers, self.fusers)):
 
             reference_points_input = reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[None, :]  # dn+nq, bs, num_levels, 4
             query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :]) # dn+nq, bs, d_model*2
+            query_pos = self.ref_point_head(query_sine_embed)  # dn+nq, bs, d_model
 
-            # conditional query
-            raw_query_pos = self.ref_point_head(query_sine_embed)  # dn+nq, bs, d_model
-            pos_scale = self.query_scale(output) if self.query_scale is not None else 1  # 1
-            query_pos = pos_scale * raw_query_pos  # dn+nq, bs, d_model
+            sub_reference_points_input = sub_reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[None, :]  # dn+nq, bs, num_levels, 4
+            sub_query_sine_embed = gen_sineembed_for_position(sub_reference_points_input[:, :, 0, :]) # dn+nq, bs, d_model*2
+            sub_query_pos = self.sub_ref_point_head(sub_query_sine_embed)  # dn+nq, bs, d_model
 
-            output = layer(  # dn+nq, bs, d_model
-                    tgt = output,  # dn+nq, bs, d_model
-                    tgt_query_pos = query_pos,  # dn+nq, bs, d_model
-                    tgt_reference_points = reference_points_input,  # dn+nq, bs, num_levels, 4
+            fused_pos, sub_fused_pos = fuser.pair_fusion(output, query_pos, sub_output, sub_query_pos)
 
-                    memory = memory,  # sum(hi*wi), bs, d_model
-                    memory_key_padding_mask = memory_key_padding_mask,  # bs, sum(hi*wi)
-                    memory_level_start_index = level_start_index,  # num_levels
-                    memory_spatial_shapes = spatial_shapes,  # num_levels, 2
+            # object block
+            # (dn+nq,bs,d_model) (dn+nq,bs,d_model) (dn+nq,bs,num_levels,4) (sum(hi*wi),bs,d_model) (bs,sum(hi*wi))
+            # (num_levels,) (num_levels, 2) (dn+nq,dn+nq) => (dn+nq,bs,d_model)
+            output = layer(output, fused_pos, reference_points_input, memory, memory_key_padding_mask,
+                           level_start_index, spatial_shapes, tgt_mask)
+            new_reference_points = (self.bbox_embed[layer_id](output) + inverse_sigmoid(reference_points)).sigmoid()  # dn+nq, bs, 4
 
-                    self_attn_mask = tgt_mask,  # dn+nq, dn+nq
-                )
+            # human block
+            sub_output = sub_layer(sub_output, sub_fused_pos, sub_reference_points_input, memory, memory_key_padding_mask,
+                                   level_start_index, spatial_shapes, tgt_mask)
+            sub_new_reference_points = (self.sub_bbox_embed[layer_id](sub_output) + inverse_sigmoid(sub_reference_points)).sigmoid()  # dn+nq, bs, 4
 
-            # iter update
-            if self.bbox_embed is not None:
-                reference_before_sigmoid = inverse_sigmoid(reference_points)  # dn+nq, bs, 4
-                delta_unsig = self.bbox_embed[layer_id](output)  # dn+nq, bs, 4
-                outputs_unsig = delta_unsig + reference_before_sigmoid  # dn+nq, bs, 4
-                new_reference_points = outputs_unsig.sigmoid()  # dn+nq, bs, 4
+            # interaction block
+            hoi_reference_points = box_union(new_reference_points, sub_new_reference_points)
+            hoi_reference_points_input = hoi_reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[None, :]
 
-                reference_points = new_reference_points.detach()  # dn+nq, bs, 4
-                ref_points.append(new_reference_points)  # 7, dn+nq, bs, 4
+            # reference_points_input = new_reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[None, :]
+            # query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :]) # dn+nq, bs, d_model*2
+            # sub_reference_points_input = sub_new_reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[None, :]  # dn+nq, bs, num_levels, 4
+            # sub_query_sine_embed = gen_sineembed_for_position(sub_reference_points_input[:, :, 0, :])  # dn+nq, bs, d_model*2
+            # hoi_query_pos = self.hoi_ref_point_head(torch.cat([output, sub_output], dim=-1))  # dn+nq, bs, d_model
 
+            hoi_fused_pos = fuser.ternary_fusion(output, new_reference_points, sub_output, sub_new_reference_points)
+
+            hoi_output = hoi_layer(hoi_output, hoi_fused_pos, hoi_reference_points_input, memory, memory_key_padding_mask,  # TODO use hoi_fused_output or hoi_query_pos
+                                   level_start_index, spatial_shapes, tgt_mask)
+            # hoi_output = fuser.ternary_fusion(sub_output, output, hoi_output, hoi_query_pos)
+            # hoi_output = fuser.ffn(hoi_output)
+
+            reference_points, sub_reference_points = new_reference_points.detach(), sub_new_reference_points.detach()  # dn+nq, bs, 4
+
+            ref_points.append(new_reference_points)  # 7, dn+nq, bs, 4
             intermediate.append(self.norm(output))  # 6, dn+nq, bs, d_model
+            sub_ref_points.append(sub_new_reference_points)  # 7, dn+nq, bs, 4
+            sub_intermediate.append(self.sub_norm(sub_output))  # 6, dn+nq, bs, d_model
+            hoi_intermediate.append(self.hoi_norm(hoi_output))  # 6, dn+nq, bs, d_model
 
         return [
+            [sub_itm_out.transpose(0, 1) for sub_itm_out in sub_intermediate],
+            [sub_itm_refpoint.transpose(0, 1) for sub_itm_refpoint in sub_ref_points],
             [itm_out.transpose(0, 1) for itm_out in intermediate],
-            [itm_refpoint.transpose(0, 1) for itm_refpoint in ref_points]
+            [itm_refpoint.transpose(0, 1) for itm_refpoint in ref_points],
+            [hoi_itm_out.transpose(0, 1) for hoi_itm_out in hoi_intermediate],
         ]
 
 
@@ -323,7 +367,7 @@ class DeformableTransformerEncoderLayer(nn.Module):
 
 
 class DeformableTransformerDecoderLayer(nn.Module):
-    def __init__(self, d_model=256, d_ffn=1024,dropout=0.1, activation="relu", n_levels=4, n_heads=8, n_points=4):
+    def __init__(self, d_model=256, d_ffn=1024, dropout=0.1, activation="relu", n_levels=4, n_heads=8, n_points=4):
         super().__init__()
 
         # cross attention
@@ -338,16 +382,11 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         # ffn
         self.linear1 = nn.Linear(d_model, d_ffn)
-        self.activation = _get_activation_fn(activation, d_model=d_ffn, batch_dim=1)
+        self.activation = _get_activation_fn(activation)
         self.dropout3 = nn.Dropout(dropout)
         self.linear2 = nn.Linear(d_ffn, d_model)
         self.dropout4 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
-
-    def rm_self_attn_modules(self):
-        self.self_attn = None
-        self.dropout2 = None
-        self.norm2 = None
 
     @staticmethod
     def with_pos_embed(tensor, pos):
@@ -381,18 +420,80 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
     def forward(self, tgt, tgt_query_pos, tgt_reference_points, memory, memory_key_padding_mask,
                 memory_level_start_index, memory_spatial_shapes, self_attn_mask):
-
         # self-attn
         tgt = self.forward_sa(tgt, tgt_query_pos, self_attn_mask)
-
         # cross-attn
         tgt = self.forward_ca(tgt, tgt_query_pos, tgt_reference_points, memory, memory_key_padding_mask,
                               memory_level_start_index, memory_spatial_shapes)
-
         # FFN
         tgt = self.forward_ffn(tgt)
 
         return tgt
+
+
+class Fuser(nn.Module):
+    def __init__(self, d_model, activation, d_ffn, dropout):
+        super().__init__()
+
+        # pair_fusion
+        self.sub_weight1 = nn.Linear(d_model, d_model)
+        self.obj_weight1 = nn.Linear(d_model, d_model)
+        self.cross_norm = nn.LayerNorm(d_model)
+        self.cross_act = _get_activation_fn(activation)
+        self.sub_weight2 = nn.Linear(d_model, d_model)
+        self.obj_weight2 = nn.Linear(d_model, d_model)
+        self.sub_norm = nn.LayerNorm(d_model)
+        self.obj_norm = nn.LayerNorm(d_model)
+
+        # ternary_fusion
+        self.sub_weight3 = nn.Linear(d_model, d_model)
+        self.sub_norm = nn.LayerNorm(d_model)
+        self.sub_act = _get_activation_fn(activation)
+        self.sub_weight4 = nn.Linear(d_model, d_model)
+
+        self.obj_weight3 = nn.Linear(d_model, d_model)
+        self.obj_norm = nn.LayerNorm(d_model)
+        self.obj_act = _get_activation_fn(activation)
+        self.obj_weight4 = nn.Linear(d_model, d_model)
+
+        self.hoi_weight1 = nn.Linear(16, 64)
+        self.hoi_norm1 = nn.LayerNorm(64)
+        self.hoi_act = _get_activation_fn(activation)
+        self.hoi_weight2 = nn.Linear(64, d_model)
+        self.hoi_norm2 = nn.LayerNorm(d_model)
+        #
+        #
+        # # ffn
+        # self.linear1 = nn.Linear(d_model, d_ffn)
+        # self.activation = _get_activation_fn(activation)
+        # self.dropout1 = nn.Dropout(dropout)
+        # self.linear2 = nn.Linear(d_ffn, d_model)
+        # self.dropout2 = nn.Dropout(dropout)
+        # self.ffn_norm = nn.LayerNorm(d_model)
+
+    def pair_fusion(self, sub_content, sub_position, obj_content, obj_position):
+        # Xc = ReLU(LN(Ws0 * Xs + Wo0 * Xo))  Xs' = Xs + Ws1 * Xc + Ps  Xo' = Xo + Wo1 * Xc + Po
+        cross_content = self.cross_act(self.cross_norm(self.sub_weight1(sub_content) + self.obj_weight1(obj_content)))
+        new_sub_position = self.sub_norm(self.sub_weight2(cross_content) + sub_position)
+        new_obj_position = self.obj_norm(self.obj_weight2(cross_content) + obj_position)
+        return new_sub_position, new_obj_position
+
+    def ternary_fusion(self, obj_content, obj_position, sub_content, sub_position):
+        # Xc = Ws2 * ReLU(LN(Ws1 * Xs)) +Wo2 * ReLU(LN(Wo1 * Xo))  Xh' = LN(Xh + Xc + Wc * ReLU(Ws3 * Ps + Wo3 * Po))
+        cross_content = self.sub_weight4(self.sub_act(self.sub_norm(self.sub_weight3(sub_content)))) + \
+                        self.obj_weight4(self.obj_act(self.obj_norm(self.obj_weight3(obj_content))))
+        spatial_feature = compute_spatial_feature(sub_position, obj_position)
+        cross_position = self.hoi_weight2(self.hoi_act(self.hoi_norm1(self.hoi_weight1(
+            torch.cat([sub_position, obj_position, spatial_feature], dim=-1)))))
+        new_hoi_position = self.hoi_norm2(cross_content + cross_position)
+        return new_hoi_position
+    #
+    # def ffn(self, tgt):
+    #     # feed forward network
+    #     tgt2 = self.linear2(self.dropout1(self.activation(self.linear1(tgt))))
+    #     tgt = tgt + self.dropout2(tgt2)
+    #     tgt = self.ffn_norm(tgt)
+    #     return tgt
 
 
 def _get_clones(module, N, layer_share=False):

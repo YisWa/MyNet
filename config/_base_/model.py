@@ -8,7 +8,7 @@ backbone_freeze_keywords = None
 
 # Transformer
 enc_layers = 6
-dec_layers = 6
+dec_layers = 2
 dim_feedforward = 2048
 hidden_dim = 256
 dropout = 0.0
@@ -40,10 +40,14 @@ interm_loss_coef = 1.0
 no_interm_box_loss = False
 focal_alpha = 0.25
 focal_gamma = 2.0
-verb_loss_type = 'focal'
 
 # DeNoising
 use_dn = True
 dn_number = 100
 dn_box_noise_scale = 0.4
 dn_label_noise_ratio = 0.5
+
+# NMS
+use_nms = True
+nms_number = 100
+nms_thresh = 0.5

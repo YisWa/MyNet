@@ -127,6 +127,7 @@ class HICODetection(torch.utils.data.Dataset):
             target['boxes'] = boxes
             target['labels'] = classes
             target['id'] = idx
+            target['file_name'] = img_anno['file_name']
 
             if self._transforms is not None:
                 img, _ = self._transforms(img, None)

@@ -2,20 +2,6 @@
 <project version="4">
   <component name="PublishConfigData" autoUpload="Always" serverName="wangyisen@210.28.135.177:17022" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
-      <paths name="AdaMixer">
-        <serverdata>
-          <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="STIP">
-        <serverdata>
-          <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
       <paths name="wangyisen@210.28.135.177:17022">
         <serverdata>
           <mappings>
@@ -26,7 +12,7 @@
       <paths name="wangyisen@210.28.135.177:17022 (1)">
         <serverdata>
           <mappings>
-            <mapping deploy="/data1/wangyisen/MyNet" local="$PROJECT_DIR$" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

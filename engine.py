@@ -3,10 +3,6 @@
 Train and eval functions used in main.py
 """
 
-import math
-import os
-import sys
-from typing import Iterable
 import copy
 import itertools
 import numpy as np
@@ -18,18 +14,15 @@ from datasets.hico_eval import HICOEvaluator
 from datasets.vcoco_eval import VCOCOEvaluator
 
 
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, args):
+def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, args):
 
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch + 1)
-    print_freq = 100
 
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+    for samples, targets in metric_logger.log_every(data_loader, args.print_frequency, header):
 
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -43,7 +36,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         losses.backward()
         # for name, param in model.named_parameters():
         #     if param.grad is None:
-        #         print(name)
+        #     print(name)
+        # break
         if args.clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_max_norm)
         optimizer.step()
@@ -58,17 +52,15 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(dataset_file, model, postprocessors, data_loader, subject_category_id, device):
+def evaluate(dataset_file, model, postprocessors, data_loader, device, args):
     model.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
-    print_freq = 100
 
     preds = []
     gts = []
-    # indices = []
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+    for samples, targets in metric_logger.log_every(data_loader, 100, header):
         samples = samples.to(device)
 
         outputs = model(samples)
@@ -88,11 +80,14 @@ def evaluate(dataset_file, model, postprocessors, data_loader, subject_category_
     gts = [img_gts for i, img_gts in enumerate(gts) if i in indices]
 
     if dataset_file == 'hico':
-        evaluator = HICOEvaluator(preds, gts, subject_category_id, data_loader.dataset.rare_triplets,
-                                  data_loader.dataset.non_rare_triplets, data_loader.dataset.correct_mat)
-    elif dataset_file == 'vcoco':
-        evaluator = VCOCOEvaluator(preds, gts, subject_category_id, data_loader.dataset.correct_mat)
+        evaluator = HICOEvaluator(preds, gts, args.hoi_path, use_nms=args.use_nms, nms_thresh=args.nms_thresh)
+        stats = evaluator.evaluation(mode="df")
+        stats_ko = evaluator.evaluation(mode="ko")
+        stats.update(stats_ko)
 
-    stats = evaluator.evaluate()
+    elif dataset_file == 'vcoco':
+        evaluator = VCOCOEvaluator(preds, gts, args.subject_category_id, data_loader.dataset.correct_mat,
+                                   use_nms=args.use_nms, nms_thresh=args.nms_thresh)
+        stats = evaluator.evaluate()
 
     return stats

@@ -2,7 +2,7 @@
 """
 Utilities for bounding box manipulation and GIoU.
 """
-import torch, os
+import torch, math
 from torchvision.ops.boxes import box_area
 
 
@@ -131,8 +131,66 @@ def masks_to_boxes(masks):
 
     return torch.stack([x_min, y_min, x_max, y_max], 1)
 
+
+def box_union(boxes1, boxes2):
+    """
+    计算两组框的并集
+    Args:
+        boxes1: 第一组框，形状为[bs, n, 4]
+        boxes2: 第二组框，形状为[bs, n, 4]
+    Returns:
+        并集框，形状为[bs, n, 4]
+    """
+    # 获取框的左上角和右下角坐标
+    boxes1_left_top = boxes1[..., :2] - boxes1[..., 2:] / 2
+    boxes1_right_bottom = boxes1[..., :2] + boxes1[..., 2:] / 2
+    boxes2_left_top = boxes2[..., :2] - boxes2[..., 2:] / 2
+    boxes2_right_bottom = boxes2[..., :2] + boxes2[..., 2:] / 2
+
+    # 计算并集框的左上角和右下角坐标
+    union_left_top = torch.min(boxes1_left_top, boxes2_left_top)
+    union_right_bottom = torch.max(boxes1_right_bottom, boxes2_right_bottom)
+
+    # 计算并集框的宽和高
+    union_w = union_right_bottom[..., 0] - union_left_top[..., 0]
+    union_h = union_right_bottom[..., 1] - union_left_top[..., 1]
+
+    # 计算并集框的中心点横坐标、纵坐标、宽度和高度
+    union_x = (union_left_top[..., 0] + union_right_bottom[..., 0]) / 2
+    union_y = (union_left_top[..., 1] + union_right_bottom[..., 1]) / 2
+    union_w = torch.clamp(union_w, min=0)  # 宽度可能为负数，需要裁剪
+    union_h = torch.clamp(union_h, min=0)  # 高度可能为负数，需要裁剪
+
+    # 组合并集框的坐标和尺寸
+    union_boxes = torch.stack([union_x, union_y, union_w, union_h], dim=-1)
+
+    return union_boxes
+
+
+def compute_spatial_feature(boxes1, boxes2):
+
+    dx = boxes1[:, :, 0] - boxes2[:, :, 0]
+    dy = boxes1[:, :, 1] - boxes2[:, :, 1]
+    dist = torch.stack([dx, dy], dim=-1)
+    dist = torch.cat([dist, torch.norm(dist, dim=-1, keepdim=True)], dim=-1)
+    dist = torch.cat([dist, (torch.atan2(dy, dx) / math.pi).unsqueeze(-1)], dim=-1)
+
+    area1 = (boxes1[:, :, 2] * boxes1[:, :, 3]).unsqueeze(-1)
+    area2 = (boxes2[:, :, 2] * boxes2[:, :, 3]).unsqueeze(-1)
+
+    boxes1_lt, boxes1_rb = boxes1[..., :2] - boxes1[..., 2:] / 2, boxes1[..., :2] + boxes1[..., 2:] / 2
+    boxes2_lt, boxes2_rb = boxes2[..., :2] - boxes2[..., 2:] / 2, boxes2[..., :2] + boxes2[..., 2:] / 2
+
+    inter_lt = torch.max(boxes1_lt, boxes2_lt)
+    inter_rb = torch.min(boxes1_rb, boxes2_rb)
+    inter_wh = (inter_rb - inter_lt).clamp(min=0)
+    inter = (inter_wh[..., 0] * inter_wh[..., 1]).unsqueeze(-1)
+    union = area1 + area2 - inter
+    return torch.cat([dist, area1, area2, inter, union], dim=-1)
+
+
 if __name__ == '__main__':
-    x = torch.rand(5, 4)
-    y = torch.rand(3, 4)
-    iou, union = box_iou(x, y)
-    import ipdb; ipdb.set_trace()
+    x = torch.tensor([[[3,2,2,2],[3,2,2,2]],[[3,2,2,2],[3,2,2,2]]]).float()
+    y = torch.tensor([[[2,3,2,2],[2,3,2,2]],[[2,3,2,2],[2,3,2,2]]]).float()
+    b = compute_spatial_feature(x, y)
+    print(b)

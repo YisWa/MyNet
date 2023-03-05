@@ -1,29 +1,171 @@
 # ------------------------------------------------------------------------
-# Copyright (c) Hitachi, Ltd. All Rights Reserved.
+# QAHOI
+# Copyright (c) 2021 Junwen Chen. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 import numpy as np
-from collections import defaultdict
+import os
+import json
+
+
+def compute_area(bbox, invalid=None):
+    x1, y1, x2, y2 = bbox
+
+    if (x2 <= x1) or (y2 <= y1):
+        area = invalid
+    else:
+        area = (x2 - x1 + 1) * (y2 - y1 + 1)
+
+    return area
+
+
+def compute_iou(bbox1, bbox2, verbose=False):
+    x1, y1, x2, y2 = bbox1
+    x1_, y1_, x2_, y2_ = bbox2
+
+    x1_in = max(x1, x1_)
+    y1_in = max(y1, y1_)
+    x2_in = min(x2, x2_)
+    y2_in = min(y2, y2_)
+
+    intersection = compute_area(bbox=[x1_in, y1_in, x2_in, y2_in], invalid=0.0)
+
+    area1 = compute_area(bbox1, invalid=0.0)
+    area2 = compute_area(bbox2, invalid=0.0)
+    union = area1 + area2 - intersection
+    iou = intersection / (union + 1e-6)
+
+    if verbose:
+        return iou, intersection, union
+
+    return iou
+
+
+def match_hoi(pred_det, gt_dets):
+    is_match = False
+    remaining_gt_dets = [gt_det for gt_det in gt_dets]
+    for i, gt_det in enumerate(gt_dets):
+        human_iou = compute_iou(pred_det['human_box'], gt_det['human_box'])
+        if human_iou > 0.5:
+            object_iou = compute_iou(pred_det['object_box'], gt_det['object_box'])
+            if object_iou > 0.5:
+                is_match = True
+                del remaining_gt_dets[i]
+                break
+
+    return is_match, remaining_gt_dets
+
+
+def compute_ap(precision, recall):
+    if np.any(np.isnan(recall)):
+        return np.nan
+
+    ap = 0
+    for t in np.arange(0, 1.1, 0.1):  # 0, 0.1, 0.2, ..., 1.0
+        selected_p = precision[recall >= t]
+        if selected_p.size == 0:
+            p = 0
+        else:
+            p = np.max(selected_p)
+        ap += p / 11.
+
+    return ap
+
+
+def compute_pr(y_true, y_score, npos):
+    sorted_y_true = [y for y, _ in
+                     sorted(zip(y_true, y_score), key=lambda x: x[1], reverse=True)]
+    tp = np.array(sorted_y_true)
+
+    if len(tp) == 0:
+        return 0, 0, False
+
+    fp = ~tp
+    tp = np.cumsum(tp)
+    fp = np.cumsum(fp)
+    if npos == 0:
+        recall = np.nan * tp
+    else:
+        recall = tp / npos
+    precision = tp / (tp + fp)
+    return precision, recall, True
+
+
+def compute_center_distacne(bbox1, bbox2, img_h, img_w):
+    x11, y11, x12, y12 = bbox1
+    x21, y21, x22, y22 = bbox2
+
+    c_x1 = (x11 + x12) / 2.0 / img_w
+    c_x2 = (x21 + x22) / 2.0 / img_w
+    c_y1 = (y11 + y12) / 2.0 / img_h
+    c_y2 = (y21 + y22) / 2.0 / img_h
+
+    diff_x = c_x1 - c_x2
+    diff_y = c_y1 - c_y2
+
+    distance = np.linalg.norm(np.array([diff_x, diff_y]))
+    return distance
+
+
+def compute_large_area(bbox1, bbox2, img_h, img_w, invalid=0.0):
+    x11, y11, x12, y12 = bbox1
+    x21, y21, x22, y22 = bbox2
+
+    if (x12 <= x11) or (y12 <= y11):
+        area1 = invalid
+    else:
+        area1 = (x12 - x11 + 1) / img_w * (y12 - y11 + 1) / img_h
+
+    if (x22 <= x21) or (y22 <= y21):
+        area2 = invalid
+    else:
+        area2 = (x22 - x21 + 1) / img_w * (y22 - y21 + 1) / img_h
+
+    area = max(area1, area2)
+
+    return area
 
 
 class HICOEvaluator():
-    def __init__(self, preds, gts, subject_category_id, rare_triplets, non_rare_triplets, correct_mat):
-        self.overlap_iou = 0.5
+    def __init__(self, preds, gts, dataset_path, bins_num=10, use_nms=True, nms_thresh=0.5):
+        self.bins_num = bins_num
+        self.bins = np.linspace(0, 1.0, self.bins_num + 1)
+        self.compute_extra = {'distance': compute_center_distacne, 'area': compute_large_area}
+        self.extra_keys = list(self.compute_extra.keys())
+        self.ap_compute_set = {k: v for k, v in
+                               zip(self.extra_keys, [self._ap_compute_set() for i in range(len(self.extra_keys))])}
+        self.img_size_info = {}
+        self.img_folder = os.path.join(dataset_path, 'images/test2015')
+        self.anno_path = os.path.join(dataset_path, "annotations")
+        self.annotations = self.load_gt_dets()
+        self.hoi_list = json.load(open(os.path.join(self.anno_path, 'hoi_list_new.json'), 'r'))
+        self.file_name_to_obj_cat = json.load(open(os.path.join(self.anno_path, 'file_name_to_obj_cat.json'), "r"))
+        self.nms_thresh = nms_thresh
+
+        self.global_ids = self.annotations.keys()
+        self.hoi_id_to_num = json.load(open(os.path.join(self.anno_path, 'hoi_id_to_num.json'), "r"))
+        self.rare_id_json = [key for key, item in self.hoi_id_to_num.items() if item['rare']]
+
+        self.correct_mat = np.load(os.path.join(self.anno_path, 'corre_hico.npy'))
+        self.valid_obj_ids = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13,
+                              14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                              24, 25, 27, 28, 31, 32, 33, 34, 35, 36,
+                              37, 38, 39, 40, 41, 42, 43, 44, 46, 47,
+                              48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
+                              58, 59, 60, 61, 62, 63, 64, 65, 67, 70,
+                              72, 73, 74, 75, 76, 77, 78, 79, 80, 81,
+                              82, 84, 85, 86, 87, 88, 89, 90)
+        self.valid_verb_ids = list(range(1, 118))
+
+        self.pred_anno = {}
+        self.preds_t = []
+        self.use_nms = use_nms
         self.max_hois = 100
 
-        self.rare_triplets = rare_triplets
-        self.non_rare_triplets = non_rare_triplets
-
-        self.fp = defaultdict(list)
-        self.tp = defaultdict(list)
-        self.score = defaultdict(list)
-        self.sum_gts = defaultdict(lambda: 0)
-        self.gt_triplets = []
-
-        self.preds = []
-        for img_preds in preds:
+        for img_preds, img_gts in zip(preds, gts):
             img_preds = {k: v.to('cpu').numpy() for k, v in img_preds.items()}
-            bboxes = [{'bbox': bbox, 'category_id': label} for bbox, label in zip(img_preds['boxes'], img_preds['labels'])]
+            bboxes = [{'bbox': bbox, 'category_id': self.valid_obj_ids[label]} for bbox, label in
+                      zip(img_preds['boxes'], img_preds['labels'])]
             hoi_scores = img_preds['verb_scores']
             verb_labels = np.tile(np.arange(hoi_scores.shape[1]), (hoi_scores.shape[0], 1))
             subject_ids = np.tile(img_preds['sub_ids'], (hoi_scores.shape[1], 1)).T
@@ -35,207 +177,258 @@ class HICOEvaluator():
             object_ids = object_ids.ravel()
 
             if len(subject_ids) > 0:
-                object_labels = np.array([bboxes[object_id]['category_id'] for object_id in object_ids])
-                masks = correct_mat[verb_labels, object_labels]
+                object_labels = np.array(
+                    [self.valid_obj_ids.index(bboxes[object_id]['category_id']) for object_id in object_ids])
+                masks = self.correct_mat[verb_labels, object_labels]
                 hoi_scores *= masks
 
-                hois = [{'subject_id': subject_id, 'object_id': object_id, 'category_id': category_id, 'score': score} for
-                        subject_id, object_id, category_id, score in zip(subject_ids, object_ids, verb_labels, hoi_scores)]
+                hois = [
+                    {'subject_id': subject_id, 'object_id': object_id, 'category_id': self.valid_verb_ids[category_id],
+                     'score': score} for
+                    subject_id, object_id, category_id, score in zip(subject_ids, object_ids, verb_labels, hoi_scores)]
                 hois.sort(key=lambda k: (k.get('score', 0)), reverse=True)
                 hois = hois[:self.max_hois]
             else:
                 hois = []
 
-            self.preds.append({
+            filename = img_gts["file_name"].split('.')[0]
+            self.preds_t.append({
+                'filename': filename,
                 'predictions': bboxes,
                 'hoi_prediction': hois
             })
 
-        self.gts = []
-        for img_gts in gts:
-            img_gts = {k: v.to('cpu').numpy() for k, v in img_gts.items() if k != 'id'}
-            self.gts.append({
-                'annotations': [{'bbox': bbox, 'category_id': label} for bbox, label in zip(img_gts['boxes'], img_gts['labels'])],
-                'hoi_annotation': [{'subject_id': hoi[0], 'object_id': hoi[1], 'category_id': hoi[2]} for hoi in img_gts['hois']]
-            })
-            for hoi in self.gts[-1]['hoi_annotation']:
-                triplet = (self.gts[-1]['annotations'][hoi['subject_id']]['category_id'],
-                           self.gts[-1]['annotations'][hoi['object_id']]['category_id'],
-                           hoi['category_id'])
+        if self.use_nms:
+            self.preds_t = self.triplet_nms_filter(self.preds_t)
 
-                if triplet not in self.gt_triplets:
-                    self.gt_triplets.append(triplet)
+        for preds_i in self.preds_t:
 
-                self.sum_gts[triplet] += 1
+            # convert
+            global_id = preds_i["filename"]
+            self.pred_anno[global_id] = {}
+            hois = preds_i["hoi_prediction"]
+            bboxes = preds_i["predictions"]
+            for hoi in hois:
+                obj_id = bboxes[hoi['object_id']]['category_id']
+                obj_bbox = bboxes[hoi['object_id']]['bbox']
+                sub_bbox = bboxes[hoi['subject_id']]['bbox']
+                score = hoi['score']
+                verb_id = hoi['category_id']
 
-    def evaluate(self):
-        for img_preds, img_gts in zip(self.preds, self.gts):
-            pred_bboxes = img_preds['predictions']
-            gt_bboxes = img_gts['annotations']
-            pred_hois = img_preds['hoi_prediction']
-            gt_hois = img_gts['hoi_annotation']
-            if len(gt_bboxes) != 0:
-                bbox_pairs, bbox_overlaps = self.compute_iou_mat(gt_bboxes, pred_bboxes)
-                self.compute_fptp(pred_hois, gt_hois, bbox_pairs, pred_bboxes, bbox_overlaps)
-            else:
-                for pred_hoi in pred_hois:
-                    triplet = [pred_bboxes[pred_hoi['subject_id']]['category_id'],
-                               pred_bboxes[pred_hoi['object_id']]['category_id'], pred_hoi['category_id']]
-                    if triplet not in self.gt_triplets:
-                        continue
-                    self.tp[triplet].append(0)
-                    self.fp[triplet].append(1)
-                    self.score[triplet].append(pred_hoi['score'])
-        map = self.compute_map()
-        return map
+                hoi_id = '0'
+                for item in self.hoi_list:
+                    if item['object_cat'] == obj_id and item['verb_id'] == verb_id:
+                        hoi_id = item['id']
+                assert int(hoi_id) > 0
 
-    def compute_map(self):
-        ap = defaultdict(lambda: 0)
-        rare_ap = defaultdict(lambda: 0)
-        non_rare_ap = defaultdict(lambda: 0)
-        max_recall = defaultdict(lambda: 0)
-        for triplet in self.gt_triplets:
-            sum_gts = self.sum_gts[triplet]
-            if sum_gts == 0:
+                data = np.array([sub_bbox[0], sub_bbox[1], sub_bbox[2], sub_bbox[3],
+                                 obj_bbox[0], obj_bbox[1], obj_bbox[2], obj_bbox[3],
+                                 score]).reshape(1, 9)
+                if hoi_id not in self.pred_anno[global_id]:
+                    self.pred_anno[global_id][hoi_id] = np.empty([0, 9])
+
+                self.pred_anno[global_id][hoi_id] = np.concatenate((self.pred_anno[global_id][hoi_id], data), axis=0)
+
+    def load_gt_dets(self):
+        anno_list = json.load(open(os.path.join(self.anno_path, 'anno_list.json'), "r"))
+
+        gt_dets = {}
+        for anno in anno_list:
+            if "test" not in anno['global_id']:
                 continue
 
-            tp = np.array((self.tp[triplet]))
-            fp = np.array((self.fp[triplet]))
-            if len(tp) == 0:
-                ap[triplet] = 0
-                max_recall[triplet] = 0
-                if triplet in self.rare_triplets:
-                    rare_ap[triplet] = 0
-                elif triplet in self.non_rare_triplets:
-                    non_rare_ap[triplet] = 0
+            global_id = anno['global_id']
+            gt_dets[global_id] = {}
+            img_h, img_w, _ = anno['image_size']
+            self.img_size_info[global_id] = [img_h, img_w]
+            for hoi in anno['hois']:
+                hoi_id = hoi['id']
+                gt_dets[global_id][hoi_id] = []
+                for human_box_num, object_box_num in hoi['connections']:
+                    human_box = hoi['human_bboxes'][human_box_num]
+                    object_box = hoi['object_bboxes'][object_box_num]
+                    det = {
+                        'human_box': human_box,
+                        'object_box': object_box,
+                    }
+                    gt_dets[global_id][hoi_id].append(det)
+
+        return gt_dets
+
+    def _ap_compute_set(self):
+        out = {
+            'y_true': [[] for i in range(self.bins_num)],
+            'y_score': [[] for i in range(self.bins_num)],
+            'npos': [0 for i in range(self.bins_num)]
+        }
+        return out
+
+    def evaluation(self, mode="df"):
+        outputs = []
+        for hoi in self.hoi_list:
+            obj_cate = None if mode == "df" else hoi['object_cat']
+            o = self.eval_hoi(hoi['id'], self.global_ids, self.annotations, self.pred_anno, mode, obj_cate)
+            outputs.append(o)
+
+        mAP = {'AP': {}, 'mAP': 0, 'invalid': 0, 'mAP_rare': 0, 'mAP_non_rare': 0}
+        map_ = map_rare = map_non_rare = 0
+        count = count_rare = count_non_rare = 0
+
+        for ap, hoi_id in outputs:
+            mAP['AP'][hoi_id] = ap
+            if not np.isnan(ap):
+                count += 1
+                map_ += ap
+                if hoi_id in self.rare_id_json:
+                    count_rare += 1
+                    map_rare += ap
                 else:
-                    print('Warning: triplet {} is neither in rare triplets nor in non-rare triplets'.format(triplet))
-                continue
+                    count_non_rare += 1
+                    map_non_rare += ap
 
-            score = np.array(self.score[triplet])
-            sort_inds = np.argsort(-score)
-            fp = fp[sort_inds]
-            tp = tp[sort_inds]
-            fp = np.cumsum(fp)
-            tp = np.cumsum(tp)
-            rec = tp / sum_gts
-            prec = tp / (fp + tp)
-            ap[triplet] = self.voc_ap(rec, prec)
-            max_recall[triplet] = np.amax(rec)
-            if triplet in self.rare_triplets:
-                rare_ap[triplet] = ap[triplet]
-            elif triplet in self.non_rare_triplets:
-                non_rare_ap[triplet] = ap[triplet]
-            else:
-                print('Warning: triplet {} is neither in rare triplets nor in non-rare triplets'.format(triplet))
-        m_ap = np.mean(list(ap.values()))
-        m_ap_rare = np.mean(list(rare_ap.values()))
-        m_ap_non_rare = np.mean(list(non_rare_ap.values()))
-        m_max_recall = np.mean(list(max_recall.values()))
+        mAP['mAP'] = map_ / count
+        mAP['invalid'] = len(outputs) - count
+        mAP['mAP_rare'] = map_rare / count_rare
+        mAP['mAP_non_rare'] = map_non_rare / count_non_rare
 
-        print('--------------------')
-        print('mAP: {} mAP rare: {}  mAP non-rare: {}  mean max recall: {}'.format(m_ap, m_ap_rare, m_ap_non_rare, m_max_recall))
-        print('--------------------')
+        if mode == "df": print('--------------------')
+        print(f"# {mode} # mAP: {mAP['mAP']:.6f} mAP_rare: {mAP['mAP_rare']:.6f} mAP_non_rare: {mAP['mAP_non_rare']:.6f}")
+        if mode == "ko": print('--------------------')
+        return {f"mAP_{mode}": mAP['mAP'], f"mAP_rare_{mode}": mAP['mAP_rare'], f"mAP_non_rare_{mode}": mAP['mAP_non_rare']}
 
-        return {'mAP': m_ap, 'mAP rare': m_ap_rare, 'mAP non-rare': m_ap_non_rare, 'mean max recall': m_max_recall}
-
-    def voc_ap(self, rec, prec):
-        ap = 0.
-        for t in np.arange(0., 1.1, 0.1):
-            if np.sum(rec >= t) == 0:
-                p = 0
-            else:
-                p = np.max(prec[rec >= t])
-            ap = ap + p / 11.
-        return ap
-
-    def compute_fptp(self, pred_hois, gt_hois, match_pairs, pred_bboxes, bbox_overlaps):
-        pos_pred_ids = match_pairs.keys()
-        vis_tag = np.zeros(len(gt_hois))
-        pred_hois.sort(key=lambda k: (k.get('score', 0)), reverse=True)
-        if len(pred_hois) != 0:
-            for pred_hoi in pred_hois:
-                is_match = 0
-                if len(match_pairs) != 0 and pred_hoi['subject_id'] in pos_pred_ids and pred_hoi['object_id'] in pos_pred_ids:
-                    pred_sub_ids = match_pairs[pred_hoi['subject_id']]
-                    pred_obj_ids = match_pairs[pred_hoi['object_id']]
-                    pred_sub_overlaps = bbox_overlaps[pred_hoi['subject_id']]
-                    pred_obj_overlaps = bbox_overlaps[pred_hoi['object_id']]
-                    pred_category_id = pred_hoi['category_id']
-                    max_overlap = 0
-                    max_gt_hoi = 0
-                    for gt_hoi in gt_hois:
-                        if gt_hoi['subject_id'] in pred_sub_ids and gt_hoi['object_id'] in pred_obj_ids \
-                           and pred_category_id == gt_hoi['category_id']:
-                            is_match = 1
-                            min_overlap_gt = min(pred_sub_overlaps[pred_sub_ids.index(gt_hoi['subject_id'])],
-                                                 pred_obj_overlaps[pred_obj_ids.index(gt_hoi['object_id'])])
-                            if min_overlap_gt > max_overlap:
-                                max_overlap = min_overlap_gt
-                                max_gt_hoi = gt_hoi
-                triplet = (pred_bboxes[pred_hoi['subject_id']]['category_id'], pred_bboxes[pred_hoi['object_id']]['category_id'],
-                           pred_hoi['category_id'])
-                if triplet not in self.gt_triplets:
+    def eval_hoi(self, hoi_id, global_ids, gt_dets, pred_anno, mode='df', obj_cate=None):
+        y_true = []
+        y_score = []
+        det_id = []
+        npos = 0
+        for global_id in global_ids:
+            if mode == 'ko':
+                if global_id + ".jpg" not in self.file_name_to_obj_cat:
                     continue
-                if is_match == 1 and vis_tag[gt_hois.index(max_gt_hoi)] == 0:
-                    self.fp[triplet].append(0)
-                    self.tp[triplet].append(1)
-                    vis_tag[gt_hois.index(max_gt_hoi)] =1
-                else:
-                    self.fp[triplet].append(1)
-                    self.tp[triplet].append(0)
-                self.score[triplet].append(pred_hoi['score'])
+                obj_cats = self.file_name_to_obj_cat[global_id + ".jpg"]
+                if int(obj_cate) not in obj_cats:
+                    continue
 
-    def compute_iou_mat(self, bbox_list1, bbox_list2):
-        iou_mat = np.zeros((len(bbox_list1), len(bbox_list2)))
-        if len(bbox_list1) == 0 or len(bbox_list2) == 0:
-            return {}
-        for i, bbox1 in enumerate(bbox_list1):
-            for j, bbox2 in enumerate(bbox_list2):
-                iou_i = self.compute_IOU(bbox1, bbox2)
-                iou_mat[i, j] = iou_i
-
-        iou_mat_ov=iou_mat.copy()
-        iou_mat[iou_mat>=self.overlap_iou] = 1
-        iou_mat[iou_mat<self.overlap_iou] = 0
-
-        match_pairs = np.nonzero(iou_mat)
-        match_pairs_dict = {}
-        match_pair_overlaps = {}
-        if iou_mat.max() > 0:
-            for i, pred_id in enumerate(match_pairs[1]):
-                if pred_id not in match_pairs_dict.keys():
-                    match_pairs_dict[pred_id] = []
-                    match_pair_overlaps[pred_id]=[]
-                match_pairs_dict[pred_id].append(match_pairs[0][i])
-                match_pair_overlaps[pred_id].append(iou_mat_ov[match_pairs[0][i],pred_id])
-        return match_pairs_dict, match_pair_overlaps
-
-    def compute_IOU(self, bbox1, bbox2):
-        if isinstance(bbox1['category_id'], str):
-            bbox1['category_id'] = int(bbox1['category_id'].replace('\n', ''))
-        if isinstance(bbox2['category_id'], str):
-            bbox2['category_id'] = int(bbox2['category_id'].replace('\n', ''))
-        if bbox1['category_id'] == bbox2['category_id']:
-            rec1 = bbox1['bbox']
-            rec2 = bbox2['bbox']
-            # computing area of each rectangles
-            S_rec1 = (rec1[2] - rec1[0]+1) * (rec1[3] - rec1[1]+1)
-            S_rec2 = (rec2[2] - rec2[0]+1) * (rec2[3] - rec2[1]+1)
-
-            # computing the sum_area
-            sum_area = S_rec1 + S_rec2
-
-            # find the each edge of intersect rectangle
-            left_line = max(rec1[1], rec2[1])
-            right_line = min(rec1[3], rec2[3])
-            top_line = max(rec1[0], rec2[0])
-            bottom_line = min(rec1[2], rec2[2])
-            # judge if there is an intersect
-            if left_line >= right_line or top_line >= bottom_line:
-                return 0
+            if hoi_id in gt_dets[global_id]:
+                candidate_gt_dets = gt_dets[global_id][hoi_id]
             else:
-                intersect = (right_line - left_line+1) * (bottom_line - top_line+1)
-                return intersect / (sum_area - intersect)
+                candidate_gt_dets = []
+
+            npos += len(candidate_gt_dets)
+
+            if global_id not in pred_anno or hoi_id not in pred_anno[global_id]:
+                hoi_dets = np.empty([0, 9])
+            else:
+                hoi_dets = pred_anno[global_id][hoi_id]
+
+            num_dets = hoi_dets.shape[0]
+
+            sorted_idx = [idx for idx, _ in sorted(
+                zip(range(num_dets), hoi_dets[:, 8].tolist()),
+                key=lambda x: x[1],
+                reverse=True)]
+            for i in sorted_idx:
+                pred_det = {
+                    'human_box': hoi_dets[i, :4],
+                    'object_box': hoi_dets[i, 4:8],
+                    'score': hoi_dets[i, 8]
+                }
+                # print(hoi_dets[i, 8])
+                is_match, candidate_gt_dets = match_hoi(pred_det, candidate_gt_dets)
+                y_true.append(is_match)
+                y_score.append(pred_det['score'])
+                det_id.append((global_id, i))
+
+        # Compute PR
+        precision, recall, mark = compute_pr(y_true, y_score, npos)
+        if not mark:
+            ap = 0
         else:
-            return 0
+            ap = compute_ap(precision, recall)
+        # Compute AP
+        # print(f'AP:{ap}')
+        return (ap, hoi_id)
+
+    # Refer to CDN: https://github.com/YueLiao/CDN/blob/main/datasets/hico_eval.py
+    def triplet_nms_filter(self, preds):
+        preds_filtered = []
+        for img_preds in preds:
+            pred_bboxes = img_preds['predictions']
+            pred_hois = img_preds['hoi_prediction']
+            all_triplets = {}
+            for index, pred_hoi in enumerate(pred_hois):
+                triplet = str(pred_bboxes[pred_hoi['subject_id']]['category_id']) + '_' + \
+                          str(pred_bboxes[pred_hoi['object_id']]['category_id']) + '_' + str(pred_hoi['category_id'])
+
+                if triplet not in all_triplets:
+                    all_triplets[triplet] = {'subs': [], 'objs': [], 'scores': [], 'indexes': []}
+                all_triplets[triplet]['subs'].append(pred_bboxes[pred_hoi['subject_id']]['bbox'])
+                all_triplets[triplet]['objs'].append(pred_bboxes[pred_hoi['object_id']]['bbox'])
+                all_triplets[triplet]['scores'].append(pred_hoi['score'])
+                all_triplets[triplet]['indexes'].append(index)
+
+            all_keep_inds = []
+            for triplet, values in all_triplets.items():
+                subs, objs, scores = values['subs'], values['objs'], values['scores']
+                keep_inds = self.pairwise_nms(np.array(subs), np.array(objs), np.array(scores))
+
+                keep_inds = list(np.array(values['indexes'])[keep_inds])
+                all_keep_inds.extend(keep_inds)
+
+            preds_filtered.append({
+                'filename': img_preds['filename'],
+                'predictions': pred_bboxes,
+                'hoi_prediction': list(np.array(img_preds['hoi_prediction'])[all_keep_inds])
+            })
+
+        return preds_filtered
+
+    # Modified from CDN: https://github.com/YueLiao/CDN/blob/main/datasets/hico_eval.py
+    def pairwise_nms(self, subs, objs, scores):
+        sx1, sy1, sx2, sy2 = subs[:, 0], subs[:, 1], subs[:, 2], subs[:, 3]
+        ox1, oy1, ox2, oy2 = objs[:, 0], objs[:, 1], objs[:, 2], objs[:, 3]
+
+        sub_areas = (sx2 - sx1 + 1) * (sy2 - sy1 + 1)
+        obj_areas = (ox2 - ox1 + 1) * (oy2 - oy1 + 1)
+
+        order = scores.argsort()[::-1]
+
+        keep_inds = []
+        while order.size > 0:
+            i = order[0]
+            keep_inds.append(i)
+
+            sxx1 = np.maximum(sx1[i], sx1[order[1:]])
+            syy1 = np.maximum(sy1[i], sy1[order[1:]])
+            sxx2 = np.minimum(sx2[i], sx2[order[1:]])
+            syy2 = np.minimum(sy2[i], sy2[order[1:]])
+
+            sw = np.maximum(0.0, sxx2 - sxx1 + 1)
+            sh = np.maximum(0.0, syy2 - syy1 + 1)
+            sub_inter = sw * sh
+            sub_union = sub_areas[i] + sub_areas[order[1:]] - sub_inter
+
+            oxx1 = np.maximum(ox1[i], ox1[order[1:]])
+            oyy1 = np.maximum(oy1[i], oy1[order[1:]])
+            oxx2 = np.minimum(ox2[i], ox2[order[1:]])
+            oyy2 = np.minimum(oy2[i], oy2[order[1:]])
+
+            ow = np.maximum(0.0, oxx2 - oxx1 + 1)
+            oh = np.maximum(0.0, oyy2 - oyy1 + 1)
+            obj_inter = ow * oh
+            obj_union = obj_areas[i] + obj_areas[order[1:]] - obj_inter
+
+            ovr = sub_inter / sub_union * obj_inter / obj_union
+            inds = np.where(ovr <= self.nms_thresh)[0]
+
+            order = order[inds + 1]
+        return keep_inds
+
+
+if __name__ == "__main__":
+    import torch
+
+    preds = torch.load("../preds.pt")
+    gts = torch.load("../gts.pt")
+    evaluator = HICOEvaluator(preds, gts, "../data/hico_20160224_det/", "../", -1)
+    evaluator.evaluation_extra()

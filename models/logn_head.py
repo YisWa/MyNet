@@ -16,12 +16,12 @@ class LogitNormHead(nn.Module):
         self.eps = 1e-5
 
     def get_statistics(self):
-        obj_mean_val = self.obj_moving_mean.view(1, -1)
-        obj_std_val = torch.sqrt(torch.clamp(self.obj_moving_var.view(1, -1), min=1e-11))
+        obj_mean_val = self.obj_moving_mean
+        obj_std_val = torch.sqrt(torch.clamp(self.obj_moving_var, min=1e-11))
         obj_beta = obj_mean_val.min()
 
-        verb_mean_val = self.verb_moving_mean.view(1, -1)
-        verb_std_val = torch.sqrt(torch.clamp(self.verb_moving_var.view(1, -1), min=1e-11))
+        verb_mean_val = self.verb_moving_mean
+        verb_std_val = torch.sqrt(torch.clamp(self.verb_moving_var, min=1e-11))
         verb_beta = verb_mean_val.min()
 
         return obj_mean_val, obj_std_val, obj_beta, verb_mean_val, verb_std_val, verb_beta

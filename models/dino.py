@@ -30,12 +30,12 @@ from .backbone import build_backbone
 from .matcher import build_matcher
 from .deformable_transformer import build_deformable_transformer
 from .logn_head import build_head
-from .utils import sigmoid_focal_loss, MLP
+from .utils import sigmoid_focal_loss, MLP, ecm_loss
 
 from .dn_components import prepare_for_cdn,dn_post_process
 class DINO(nn.Module):
     """ This is the Cross-Attention Detector module that performs object detection """
-    def __init__(self, backbone, transformer, head, num_classes, num_verb_classes,
+    def __init__(self, backbone, transformer, num_classes, num_verb_classes,
                  num_queries, aux_loss=False, num_feature_levels=1,
                  dec_pred_class_embed_share=True, dec_pred_bbox_embed_share=True,
                  two_stage_class_embed_share=True, two_stage_bbox_embed_share=True,
@@ -54,12 +54,12 @@ class DINO(nn.Module):
         self.backbone = backbone
         self.aux_loss = aux_loss
         self.transformer = transformer
-        self.head = head
         self.num_classes = num_classes
         self.num_verb_classes = num_verb_classes
         self.hidden_dim = hidden_dim = transformer.d_model
         self.num_feature_levels = num_feature_levels
-        self.label_enc = nn.Embedding(num_classes + 1, hidden_dim)
+        self.obj_label_enc = nn.Embedding(num_classes + 1, hidden_dim)
+        self.verb_label_enc = nn.Linear(num_verb_classes, hidden_dim)
 
         # for dn training
         self.dn_number = dn_number
@@ -126,7 +126,7 @@ class DINO(nn.Module):
 
         # refine point process
         self.transformer.decoder.bbox_embed = self.bbox_embed
-        # self.transformer.decoder.class_embed = self.class_embed
+        self.transformer.decoder.sub_bbox_embed = self.sub_bbox_embed
 
         # intermediate results detect head (for encoder output)
         if two_stage_bbox_embed_share:  # False
@@ -193,64 +193,46 @@ class DINO(nn.Module):
                 masks.append(mask)
                 poss.append(pos_l)
 
+        # DeNosing Preprocess
         if self.dn_number > 0 or targets is not None:
-            input_query_label, input_query_bbox, attn_mask, dn_meta = \
-                prepare_for_cdn(dn_args=(targets, self.dn_number, self.dn_label_noise_ratio, self.dn_box_noise_scale),
-                                training=self.training, num_queries=self.num_queries, num_classes=self.num_classes,
-                                hidden_dim=self.hidden_dim, label_enc=self.label_enc)
+            input_obj_labels, input_sub_labels, input_verb_labels, input_obj_boxes, input_sub_boxes, attn_mask, dn_meta = \
+                prepare_for_cdn(dn_args=(targets, self.dn_number, self.dn_label_noise_ratio, self.dn_box_noise_scale, samples.device),
+                                training=self.training, num_queries=self.num_queries, num_classes=self.num_classes, num_verb_classes=self.num_verb_classes,
+                                hidden_dim=self.hidden_dim, obj_label_enc=self.obj_label_enc, verb_label_enc=self.verb_label_enc)
         else:
             assert targets is None
-            input_query_bbox = input_query_label = attn_mask = dn_meta = None
+            input_obj_labels = input_sub_labels = input_verb_labels = None
+            input_obj_boxes = input_sub_boxes = attn_mask = dn_meta = None
 
-        hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(srcs, masks, input_query_bbox, poss, input_query_label, attn_mask)
-        # In case num object=0
-        hs[0] += self.label_enc.weight[0,0]*0.0
+        # Transformer
+        h_hs, h_ref, o_hs, o_ref, hoi, interm_class, interm_verb_class, interm_coord, interm_sub_coord = \
+            self.transformer(srcs, masks, poss, input_obj_labels, input_sub_labels, input_verb_labels, input_obj_boxes, input_sub_boxes, attn_mask)
 
-        # deformable-detr-like anchor update
-        # reference_before_sigmoid = inverse_sigmoid(reference[:-1]) # n_dec, bs, nq, 4
+        # Detector head
         outputs_coord_list, outputs_sub_coord_list = [], []
-        for dec_lid, (layer_ref_sig, layer_bbox_embed, layer_hs) in enumerate(zip(reference[:-1], self.bbox_embed, hs)):
-            layer_delta_unsig = layer_bbox_embed(layer_hs)
-            layer_outputs_unsig = layer_delta_unsig + inverse_sigmoid(layer_ref_sig)
-            layer_outputs_unsig = layer_outputs_unsig.sigmoid()
-            outputs_coord_list.append(layer_outputs_unsig)
-        outputs_coord_list = torch.stack(outputs_coord_list)
+        for l, (h_r, h_w, h_h, o_r, o_w, o_h) in enumerate(zip(h_ref[:-1], self.sub_bbox_embed, h_hs, o_ref[:-1], self.bbox_embed, o_hs)):
+            sub_coord = (h_w(h_h) + inverse_sigmoid(h_r)).sigmoid()
+            obj_coord = (o_w(o_h) + inverse_sigmoid(o_r)).sigmoid()
+            outputs_sub_coord_list.append(sub_coord)
+            outputs_coord_list.append(obj_coord)
+        outputs_sub_coord_list, outputs_coord_list = torch.stack(outputs_sub_coord_list), torch.stack(outputs_coord_list)
+        outputs_class = torch.stack([o_w(o_h) for o_w, o_h in zip(self.class_embed, o_hs)])
+        outputs_verb_class = torch.stack([v_w(verb) for v_w, verb in zip(self.verb_class_embed, hoi)])
 
-        for dec_lid, (layer_ref_sig, layer_bbox_embed, layer_hs) in enumerate(zip(reference[:-1], self.sub_bbox_embed, hs)):
-            layer_delta_unsig = layer_bbox_embed(layer_hs)
-            layer_outputs_unsig = layer_delta_unsig + inverse_sigmoid(layer_ref_sig)
-            layer_outputs_unsig = layer_outputs_unsig.sigmoid()
-            outputs_sub_coord_list.append(layer_outputs_unsig)
-        outputs_sub_coord_list = torch.stack(outputs_sub_coord_list)
-
-        outputs_class = torch.stack([layer_cls_embed(layer_hs) for layer_cls_embed, layer_hs in zip(self.class_embed, hs)])
-        outputs_verb_class = torch.stack([layer_cls_embed(layer_hs) for layer_cls_embed, layer_hs in zip(self.verb_class_embed, hs)])
+        # DeNosing Postprocess
         if self.dn_number > 0 and dn_meta is not None:
             outputs_class, outputs_verb_class, outputs_coord_list, outputs_sub_coord_list = \
                 dn_post_process(outputs_class, outputs_verb_class, outputs_coord_list, outputs_sub_coord_list,
                                 dn_meta, self.aux_loss, self._set_aux_loss)
 
-        # Logit Norm Head
-        if self.head is not None:
-            norm_outputs_class, norm_outputs_verb_class = self.head(outputs_class[-1], outputs_verb_class[-1])
-            outputs_class[-1], outputs_verb_class[-1] = norm_outputs_class, norm_outputs_verb_class
-
+        # Generate results
         out = {'pred_obj_logits': outputs_class[-1], 'pred_verb_logits': outputs_verb_class[-1],
                'pred_sub_boxes': outputs_sub_coord_list[-1],'pred_obj_boxes': outputs_coord_list[-1]}
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_verb_class,
-                                                    outputs_coord_list, outputs_sub_coord_list)
-
-        # for encoder output
-        if hs_enc is not None:
-            # prepare intermediate outputs
-            interm_coord = self.transformer.enc_out_bbox_embed(hs_enc[-1]) + init_box_proposal
-            interm_sub_coord = self.transformer.enc_out_sub_bbox_embed(hs_enc[-1]) + init_box_proposal
-            interm_class = self.transformer.enc_out_class_embed(hs_enc[-1])
-            interm_verb_class = self.transformer.enc_out_verb_class_embed(hs_enc[-1])
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_verb_class, outputs_coord_list, outputs_sub_coord_list)
+        if interm_class is not None:  # for encoder output
             out['interm_outputs'] = {'pred_obj_logits': interm_class, 'pred_verb_logits': interm_verb_class,
-                                     'pred_sub_boxes': interm_sub_coord.sigmoid(), 'pred_obj_boxes': interm_coord.sigmoid()}
-
+                                     'pred_sub_boxes': interm_sub_coord, 'pred_obj_boxes': interm_coord}
         out['dn_meta'] = dn_meta
 
         return out
@@ -267,10 +249,8 @@ class DINO(nn.Module):
 
 class SetCriterion(nn.Module):
 
-    def __init__(self, num_obj_classes, num_queries, num_verb_classes, matcher, weight_dict, focal_alpha, losses, verb_loss_type):
+    def __init__(self, num_obj_classes, num_queries, num_verb_classes, matcher, weight_dict, focal_alpha, focal_gamma, losses):
         super().__init__()
-
-        assert verb_loss_type == 'bce' or verb_loss_type == 'focal'
 
         self.num_obj_classes = num_obj_classes
         self.num_queries = num_queries
@@ -278,12 +258,44 @@ class SetCriterion(nn.Module):
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.focal_alpha = focal_alpha
-        # self.eos_coef = eos_coef
+        self.focal_gamma = focal_gamma
         self.losses = losses
-        self.verb_loss_type = verb_loss_type
 
-    def loss_obj_labels(self, outputs, targets, indices, num_interactions, log=True):
-        assert 'pred_obj_logits' in outputs
+    # def obj_labels(self, outputs, targets, indices, num_interactions):
+    #
+    #     src_logits = outputs['pred_obj_logits']
+    #
+    #     idx = self._get_src_permutation_idx(indices)
+    #     target_classes_o = torch.cat([t['obj_labels'][J] for t, (_, J) in zip(targets, indices)])
+    #     target_classes = torch.full(src_logits.shape[:2], self.num_obj_classes, dtype=torch.int64,
+    #                                 device=src_logits.device)
+    #     target_classes[idx] = target_classes_o
+    #
+    #     # loss_obj_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+    #     target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
+    #                                         dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
+    #     target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+    #
+    #     target_classes_onehot = target_classes_onehot[:, :, :-1]
+    #
+    #     loss_obj_ce = ecm_loss(src_logits, target_classes_onehot, num_interactions, 'hico', 'obj')
+    #     losses = {'loss_obj_ce': loss_obj_ce}
+    #     return losses
+    #
+    # def verb_labels(self, outputs, targets, indices, num_interactions):
+    #
+    #     src_logits = outputs['pred_verb_logits']
+    #
+    #     idx = self._get_src_permutation_idx(indices)
+    #     target_classes_o = torch.cat([t['verb_labels'][J] for t, (_, J) in zip(targets, indices)])
+    #     target_classes = torch.zeros_like(src_logits)
+    #     target_classes[idx] = target_classes_o
+    #
+    #     loss_verb_ce = ecm_loss(src_logits, target_classes, num_interactions, 'hico', 'verb')
+    #     losses = {'loss_verb_ce': loss_verb_ce}
+    #     return losses
+
+    def loss_obj_labels(self, outputs, targets, indices, num_interactions):
         src_logits = outputs['pred_obj_logits']
 
         idx = self._get_src_permutation_idx(indices)
@@ -297,26 +309,13 @@ class SetCriterion(nn.Module):
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
         target_classes_onehot = target_classes_onehot[:, :, :-1]
-        loss_obj_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_interactions, alpha=self.focal_alpha, gamma=2) * \
-                  src_logits.shape[1]
+        loss_obj_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_interactions, alpha=self.focal_alpha,
+                                         gamma=self.focal_gamma) * src_logits.shape[1]
         losses = {'loss_obj_ce': loss_obj_ce}
 
-        if log:
-            losses['obj_class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
-        return losses
-
-    @torch.no_grad()
-    def loss_obj_cardinality(self, outputs, targets, indices, num_interactions):
-        pred_logits = outputs['pred_obj_logits']
-        device = pred_logits.device
-        tgt_lengths = torch.as_tensor([len(v['obj_labels']) for v in targets], device=device)
-        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
-        card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
-        losses = {'obj_cardinality_error': card_err}
         return losses
 
     def loss_verb_labels(self, outputs, targets, indices, num_interactions):
-        assert 'pred_verb_logits' in outputs
         src_logits = outputs['pred_verb_logits']
 
         idx = self._get_src_permutation_idx(indices)
@@ -324,11 +323,8 @@ class SetCriterion(nn.Module):
         target_classes = torch.zeros_like(src_logits)
         target_classes[idx] = target_classes_o
 
-        if self.verb_loss_type == 'bce':
-            loss_verb_ce = F.binary_cross_entropy_with_logits(src_logits, target_classes)
-        elif self.verb_loss_type == 'focal':
-            src_logits = src_logits.sigmoid()
-            loss_verb_ce = self._neg_loss(src_logits, target_classes)
+        src_logits = src_logits.sigmoid()
+        loss_verb_ce = self._neg_loss(src_logits, target_classes)
 
         losses = {'loss_verb_ce': loss_verb_ce}
         return losses
@@ -397,15 +393,13 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
-    def get_loss(self, loss, outputs, targets, indices, num, **kwargs):
+    def get_loss(self, loss, outputs, targets, indices, num):
         loss_map = {
             'obj_labels': self.loss_obj_labels,
-            'obj_cardinality': self.loss_obj_cardinality,
             'verb_labels': self.loss_verb_labels,
             'sub_obj_boxes': self.loss_sub_obj_boxes
         }
-        assert loss in loss_map, f'do you really want to compute {loss} loss?'
-        return loss_map[loss](outputs, targets, indices, num, **kwargs)
+        return loss_map[loss](outputs, targets, indices, num)
 
     def forward(self, outputs, targets):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
@@ -445,11 +439,7 @@ class SetCriterion(nn.Module):
 
             l_dict = {}
             for loss in self.losses:
-                kwargs = {}
-                if 'obj_labels' in loss:
-                    kwargs = {'log': False}
-                l_dict.update(self.get_loss(loss, output_known_lbs_bboxes, targets, dn_pos_idx, num_interactions * scalar, **kwargs))
-
+                l_dict.update(self.get_loss(loss, output_known_lbs_bboxes, targets, dn_pos_idx, num_interactions * scalar))
             l_dict = {k + f'_dn': v for k, v in l_dict.items()}
             losses.update(l_dict)
 
@@ -458,33 +448,24 @@ class SetCriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
-                    kwargs = {}
-                    if loss == 'obj_labels':
-                        # Logging is enabled only for the last layer
-                        kwargs = {'log': False}
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_interactions, **kwargs)
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_interactions)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
                 if self.training and dn_meta and 'output_known_lbs_bboxes' in dn_meta:
                     aux_outputs_known = output_known_lbs_bboxes['aux_outputs'][i]
-                    l_dict={}
+                    l_dict = {}
                     for loss in self.losses:
-                        kwargs = {}
-                        if 'obj_labels' in loss:
-                            kwargs = {'log': False}
-                        l_dict.update(self.get_loss(loss, aux_outputs_known, targets, dn_pos_idx, num_interactions * scalar, **kwargs))
+                        l_dict.update(self.get_loss(loss, aux_outputs_known, targets, dn_pos_idx, num_interactions * scalar))
+                    l_dict = {k + f'_dn_{i}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
 
         # interm_outputs loss
         if 'interm_outputs' in outputs:
             interm_outputs = outputs['interm_outputs']
             indices = self.matcher(interm_outputs, targets)
             for loss in self.losses:
-                kwargs = {}
-                if loss == 'obj_labels':
-                    # Logging is enabled only for the last layer
-                    kwargs = {'log': False}
-                l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_interactions, **kwargs)
+                l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_interactions)
                 l_dict = {k + f'_interm': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
@@ -501,16 +482,15 @@ class SetCriterion(nn.Module):
 
 class PostProcess(nn.Module):
 
-    def __init__(self, subject_category_id):
+    def __init__(self, subject_category_id, nms_number):
         super().__init__()
         self.subject_category_id = subject_category_id
+        self.nms_number = nms_number
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
-        out_obj_logits, out_verb_logits, out_sub_boxes, out_obj_boxes = outputs['pred_obj_logits'], \
-                                                                        outputs['pred_verb_logits'], \
-                                                                        outputs['pred_sub_boxes'], \
-                                                                        outputs['pred_obj_boxes']
+        out_obj_logits, out_verb_logits, out_sub_boxes, out_obj_boxes = \
+            outputs['pred_obj_logits'], outputs['pred_verb_logits'], outputs['pred_sub_boxes'], outputs['pred_obj_boxes']
 
         assert len(out_obj_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
@@ -525,7 +505,7 @@ class PostProcess(nn.Module):
         # obj_prob_class_all = obj_prob[:, :, :-1] if self.no_obj else obj_prob
         num_obj_classes = obj_prob.shape[-1]
 
-        topk_values, topk_indexes = torch.topk(obj_prob.flatten(1), 100, dim=1)
+        topk_values, topk_indexes = torch.topk(obj_prob.flatten(1), self.nms_number, dim=1)
         obj_scores = topk_values
         topk_boxes = topk_indexes // num_obj_classes
         obj_labels = topk_indexes % num_obj_classes
@@ -560,16 +540,13 @@ class PostProcess(nn.Module):
 
 
 def build_dino(args):
-    use_logn_head = False
     device = torch.device(args.device)
     backbone = build_backbone(args)
     transformer = build_deformable_transformer(args)
-    head = build_head(args) if use_logn_head else None
 
     model = DINO(
         backbone,
         transformer,
-        head,
         num_classes=args.num_obj_classes,
         num_verb_classes=args.num_verb_classes,
         num_queries=args.num_queries,
@@ -579,9 +556,9 @@ def build_dino(args):
         dec_pred_bbox_embed_share=args.dec_pred_bbox_embed_share,
         two_stage_bbox_embed_share=args.two_stage_bbox_embed_share,
         two_stage_class_embed_share=args.two_stage_class_embed_share,
-        dn_number = args.dn_number if args.use_dn else 0,
-        dn_box_noise_scale = args.dn_box_noise_scale,
-        dn_label_noise_ratio = args.dn_label_noise_ratio,
+        dn_number=args.dn_number if args.use_dn else 0,
+        dn_box_noise_scale=args.dn_box_noise_scale,
+        dn_label_noise_ratio=args.dn_label_noise_ratio,
     )
     matcher = build_matcher(args)
 
@@ -612,29 +589,19 @@ def build_dino(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in clean_weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    # if args.two_stage_type != 'no':
     interm_weight_dict = {}
-    try:
-        no_interm_box_loss = args.no_interm_box_loss
-    except:
-        no_interm_box_loss = False
-    _coeff_weight_dict = {
-        'loss_obj_ce': 1.0, 'loss_verb_ce': 1.0,
-        'loss_sub_bbox': 1.0 if not no_interm_box_loss else 0.0, 'loss_obj_bbox': 1.0 if not no_interm_box_loss else 0.0,
-        'loss_sub_giou': 1.0 if not no_interm_box_loss else 0.0, 'loss_obj_giou': 1.0 if not no_interm_box_loss else 0.0,
-    }
-    try:
-        interm_loss_coef = args.interm_loss_coef
-    except:
-        interm_loss_coef = 1.0
+    _coeff_weight_dict = {'loss_obj_ce': 1.0, 'loss_verb_ce': 1.0, 'loss_sub_bbox': 1.0,
+                          'loss_obj_bbox': 1.0, 'loss_sub_giou': 1.0, 'loss_obj_giou': 1.0}
+
+    interm_loss_coef = args.interm_loss_coef
     interm_weight_dict.update({k + f'_interm': v * interm_loss_coef * _coeff_weight_dict[k] for k, v in clean_weight_dict_wo_dn.items()})
     weight_dict.update(interm_weight_dict)
 
-    losses = ['obj_labels', 'verb_labels', 'sub_obj_boxes', 'obj_cardinality']
+    losses = ['obj_labels', 'verb_labels', 'sub_obj_boxes']
     criterion = SetCriterion(args.num_obj_classes, args.num_queries, args.num_verb_classes, matcher=matcher,
-                                weight_dict=weight_dict, focal_alpha=args.focal_alpha,
-                                losses=losses, verb_loss_type=args.verb_loss_type)
+                             weight_dict=weight_dict, focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
+                             losses=losses)
     criterion.to(device)
-    postprocessors = {'hoi': PostProcess(args.subject_category_id)}
+    postprocessors = {'hoi': PostProcess(args.subject_category_id, args.nms_number)}
 
     return model, criterion, postprocessors
