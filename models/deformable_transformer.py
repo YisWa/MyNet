@@ -238,7 +238,7 @@ class TransformerDecoder(nn.Module):
         self.sub_ref_point_head = MLP(query_dim // 2 * d_model, d_model, d_model, 2)
         # self.hoi_ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
 
-        fuser = Fuser(d_model, activation="relu", d_ffn=d_model*8, dropout=0.0)
+        fuser = Fuser(d_model, activation="relu")
         self.fusers = _get_clones(fuser, num_layers, layer_share=False)
 
         self.bbox_embed = None
@@ -306,8 +306,6 @@ class TransformerDecoder(nn.Module):
 
             hoi_output = hoi_layer(hoi_output, hoi_fused_pos, hoi_reference_points_input, memory, memory_key_padding_mask,  # TODO use hoi_fused_output or hoi_query_pos
                                    level_start_index, spatial_shapes, tgt_mask)
-            # hoi_output = fuser.ternary_fusion(sub_output, output, hoi_output, hoi_query_pos)
-            # hoi_output = fuser.ffn(hoi_output)
 
             reference_points, sub_reference_points = new_reference_points.detach(), sub_new_reference_points.detach()  # dn+nq, bs, 4
 
@@ -432,7 +430,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
 
 class Fuser(nn.Module):
-    def __init__(self, d_model, activation, d_ffn, dropout):
+    def __init__(self, d_model, activation):
         super().__init__()
 
         # pair_fusion
@@ -447,29 +445,15 @@ class Fuser(nn.Module):
 
         # ternary_fusion
         self.sub_weight3 = nn.Linear(d_model, d_model)
-        self.sub_norm = nn.LayerNorm(d_model)
-        self.sub_act = _get_activation_fn(activation)
-        self.sub_weight4 = nn.Linear(d_model, d_model)
-
         self.obj_weight3 = nn.Linear(d_model, d_model)
-        self.obj_norm = nn.LayerNorm(d_model)
-        self.obj_act = _get_activation_fn(activation)
-        self.obj_weight4 = nn.Linear(d_model, d_model)
-
-        self.hoi_weight1 = nn.Linear(16, 64)
-        self.hoi_norm1 = nn.LayerNorm(64)
-        self.hoi_act = _get_activation_fn(activation)
-        self.hoi_weight2 = nn.Linear(64, d_model)
-        self.hoi_norm2 = nn.LayerNorm(d_model)
-        #
-        #
-        # # ffn
-        # self.linear1 = nn.Linear(d_model, d_ffn)
-        # self.activation = _get_activation_fn(activation)
-        # self.dropout1 = nn.Dropout(dropout)
-        # self.linear2 = nn.Linear(d_ffn, d_model)
-        # self.dropout2 = nn.Dropout(dropout)
-        # self.ffn_norm = nn.LayerNorm(d_model)
+        self.cross_norm2 = nn.LayerNorm(d_model)
+        self.cross_act2 = _get_activation_fn(activation)
+        self.spa_weight1 = nn.Linear(16, 64)
+        self.spa_norm = nn.LayerNorm(64)
+        self.spa_act = _get_activation_fn(activation)
+        self.spa_weight2 = nn.Linear(64, d_model)
+        self.cross_weight = nn.Linear(d_model, d_model)
+        self.cross_norm3 = nn.LayerNorm(d_model)
 
     def pair_fusion(self, sub_content, sub_position, obj_content, obj_position):
         # Xc = ReLU(LN(Ws0 * Xs + Wo0 * Xo))  Xs' = Xs + Ws1 * Xc + Ps  Xo' = Xo + Wo1 * Xc + Po
@@ -480,20 +464,11 @@ class Fuser(nn.Module):
 
     def ternary_fusion(self, obj_content, obj_position, sub_content, sub_position):
         # Xc = Ws2 * ReLU(LN(Ws1 * Xs)) +Wo2 * ReLU(LN(Wo1 * Xo))  Xh' = LN(Xh + Xc + Wc * ReLU(Ws3 * Ps + Wo3 * Po))
-        cross_content = self.sub_weight4(self.sub_act(self.sub_norm(self.sub_weight3(sub_content)))) + \
-                        self.obj_weight4(self.obj_act(self.obj_norm(self.obj_weight3(obj_content))))
-        spatial_feature = compute_spatial_feature(sub_position, obj_position)
-        cross_position = self.hoi_weight2(self.hoi_act(self.hoi_norm1(self.hoi_weight1(
-            torch.cat([sub_position, obj_position, spatial_feature], dim=-1)))))
-        new_hoi_position = self.hoi_norm2(cross_content + cross_position)
+        cross_content = self.cross_act2(self.cross_norm2(self.sub_weight3(sub_content) + self.obj_weight3(obj_content)))
+        spatial_feature = torch.cat([sub_position, obj_position, compute_spatial_feature(sub_position, obj_position)], dim=-1)
+        cross_position = self.spa_weight2(self.spa_act(self.spa_norm(self.spa_weight1(spatial_feature))))
+        new_hoi_position = self.cross_norm3(self.cross_weight(cross_content) + cross_position)
         return new_hoi_position
-    #
-    # def ffn(self, tgt):
-    #     # feed forward network
-    #     tgt2 = self.linear2(self.dropout1(self.activation(self.linear1(tgt))))
-    #     tgt = tgt + self.dropout2(tgt2)
-    #     tgt = self.ffn_norm(tgt)
-    #     return tgt
 
 
 def _get_clones(module, N, layer_share=False):

@@ -36,7 +36,7 @@ def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, arg
         losses.backward()
         # for name, param in model.named_parameters():
         #     if param.grad is None:
-        #     print(name)
+        #         print(name)
         # break
         if args.clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_max_norm)

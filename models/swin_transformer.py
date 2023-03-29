@@ -493,9 +493,6 @@ class SwinTransformer(nn.Module):
         self.frozen_stages = frozen_stages
         self.dilation = dilation
 
-        if use_checkpoint:
-            print("use_checkpoint!!!!!!!!!!!!!!!!!!!!!!!!")
-
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
             patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
@@ -526,7 +523,6 @@ class SwinTransformer(nn.Module):
             num_features[-1] = int(embed_dim * 2 ** (self.num_layers - 1)) // 2
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
-                # dim=int(embed_dim * 2 ** i_layer),
                 dim=num_features[i_layer],
                 depth=depths[i_layer],
                 num_heads=num_heads[i_layer],
@@ -538,12 +534,10 @@ class SwinTransformer(nn.Module):
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                 norm_layer=norm_layer,
-                # downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                 downsample=downsamplelist[i_layer],
                 use_checkpoint=use_checkpoint)
             self.layers.append(layer)
 
-        # num_features = [int(embed_dim * 2 ** i) for i in range(self.num_layers)]
         self.num_features = num_features
 
         # add a norm layer for each output
@@ -571,32 +565,6 @@ class SwinTransformer(nn.Module):
                 for param in m.parameters():
                     param.requires_grad = False
 
-    # def init_weights(self, pretrained=None):
-    #     """Initialize the weights in backbone.
-    #     Args:
-    #         pretrained (str, optional): Path to pre-trained weights.
-    #             Defaults to None.
-    #     """
-
-    #     def _init_weights(m):
-    #         if isinstance(m, nn.Linear):
-    #             trunc_normal_(m.weight, std=.02)
-    #             if isinstance(m, nn.Linear) and m.bias is not None:
-    #                 nn.init.constant_(m.bias, 0)
-    #         elif isinstance(m, nn.LayerNorm):
-    #             nn.init.constant_(m.bias, 0)
-    #             nn.init.constant_(m.weight, 1.0)
-
-    #     if isinstance(pretrained, str):
-    #         self.apply(_init_weights)
-    #         logger = get_root_logger()
-    #         load_checkpoint(self, pretrained, strict=False, logger=logger)
-    #     elif pretrained is None:
-    #         self.apply(_init_weights)
-    #     else:
-    #         raise TypeError('pretrained must be a str or None')
-
-
     def forward_raw(self, x):
         """Forward function."""
         x = self.patch_embed(x)
@@ -622,13 +590,8 @@ class SwinTransformer(nn.Module):
 
                 out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 outs.append(out)
-        # in:
-        #   torch.Size([2, 3, 1024, 1024])
-        # outs:
-        #   [torch.Size([2, 192, 256, 256]), torch.Size([2, 384, 128, 128]), \
-        #       torch.Size([2, 768, 64, 64]), torch.Size([2, 1536, 32, 32])]
-        return tuple(outs)
 
+        return tuple(outs)
 
     def forward(self, tensor_list: NestedTensor):
         x = tensor_list.tensors
@@ -656,13 +619,7 @@ class SwinTransformer(nn.Module):
 
                 out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 outs.append(out)
-        # in:
-        #   torch.Size([2, 3, 1024, 1024])
-        # out:
-        #   [torch.Size([2, 192, 256, 256]), torch.Size([2, 384, 128, 128]), \
-        #       torch.Size([2, 768, 64, 64]), torch.Size([2, 1536, 32, 32])]
 
-        # collect for nesttensors        
         outs_dict = {}
         for idx, out_i in enumerate(outs):
             m = tensor_list.mask
@@ -671,7 +628,6 @@ class SwinTransformer(nn.Module):
             outs_dict[idx] = NestedTensor(out_i, mask)
 
         return outs_dict
-
 
     def train(self, mode=True):
         """Convert the model into training mode while keep layers freezed."""
@@ -719,10 +675,3 @@ def build_swin_transformer(modelname, pretrain_img_size, **kw):
     kw_cgf.update(kw)
     model = SwinTransformer(pretrain_img_size=pretrain_img_size, **kw_cgf)
     return model
-
-if __name__ == "__main__":
-    model = build_swin_transformer('swin_L_384_22k', 384, dilation=True)
-    x = torch.rand(2, 3, 1024, 1024)
-    y = model.forward_raw(x)
-    x = torch.rand(2, 3, 384, 384)
-    y = model.forward_raw(x)

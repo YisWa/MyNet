@@ -98,7 +98,8 @@ hico_hoi_text_label = [
     (116, 'a photo of a person zipping an object')]
 
 hico_obj_text_label = [
-    (0, 'a photo of a person'), (1, 'a photo of a bicycle'), (2, 'a photo of a car'),
+    # (0, 'a photo of a person'),
+    (1, 'a photo of a bicycle'), (2, 'a photo of a car'),
     (3, 'a photo of a motorcycle'), (4, 'a photo of an airplane'), (5, 'a photo of a bus'),
     (6, 'a photo of a train'), (7, 'a photo of a truck'), (8, 'a photo of a boat'),
     (9, 'a photo of a traffic light'), (10, 'a photo of a fire hydrant'),

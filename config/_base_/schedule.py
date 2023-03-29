@@ -24,4 +24,4 @@ device = 'cuda'
 world_size = 1
 dist_url = 'env://'
 rank = 0
-find_unused_params = True
+find_unused_params = False

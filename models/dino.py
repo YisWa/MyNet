@@ -19,40 +19,33 @@ from typing import List
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torchvision.ops.boxes import nms
+import clip
 
 from util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
-from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
-                       accuracy, get_world_size, interpolate,
+from util.misc import (NestedTensor, nested_tensor_from_tensor_list, get_world_size,
                        is_dist_avail_and_initialized, inverse_sigmoid)
 
 from .backbone import build_backbone
 from .matcher import build_matcher
 from .deformable_transformer import build_deformable_transformer
-from .logn_head import build_head
-from .utils import sigmoid_focal_loss, MLP, ecm_loss
+from .utils import sigmoid_focal_loss, MLP
 
-from .dn_components import prepare_for_cdn,dn_post_process
+from .dn_components import prepare_for_cdn, dn_post_process
+
+
 class DINO(nn.Module):
-    """ This is the Cross-Attention Detector module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_verb_classes,
-                 num_queries, aux_loss=False, num_feature_levels=1,
+                 num_queries, aux_loss=False, interm_loss=False, clip_loss=False, num_feature_levels=1,
                  dec_pred_class_embed_share=True, dec_pred_bbox_embed_share=True,
                  two_stage_class_embed_share=True, two_stage_bbox_embed_share=True,
-                 dn_number = 100, dn_box_noise_scale = 0.4, dn_label_noise_ratio = 0.5):
-        """ Initializes the model.
-        Parameters:
-            backbone: torch module of the backbone to be used. See backbone.py
-            transformer: torch module of the transformer architecture. See transformer.py
-            num_classes: number of object classes
-            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
-                         Conditional DETR can detect in a single image. For COCO, we recommend 100 queries.
-            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
-        """
+                 dn_number=100, dn_box_noise_scale=0.4, dn_label_noise_ratio=0.5):
+
         super().__init__()
         self.num_queries = num_queries
         self.backbone = backbone
         self.aux_loss = aux_loss
+        self.interm_loss = interm_loss
+        self.clip_loss = clip_loss
         self.transformer = transformer
         self.num_classes = num_classes
         self.num_verb_classes = num_verb_classes
@@ -145,6 +138,12 @@ class DINO(nn.Module):
             self.transformer.enc_out_class_embed = copy.deepcopy(_class_embed)
             self.transformer.enc_out_verb_class_embed = copy.deepcopy(_verb_class_embed)
 
+        if self.clip_loss:
+            self.sub_weight = nn.Linear(hidden_dim, 512)
+            self.obj_weight = nn.Linear(hidden_dim, 512)
+            self.hoi_weight = nn.Linear(hidden_dim, 512)
+            self.fuse_norm = nn.LayerNorm(512)
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -154,20 +153,7 @@ class DINO(nn.Module):
             nn.init.constant_(proj[0].bias, 0)
 
     def forward(self, samples: NestedTensor, targets:List=None):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
-               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
 
-            It returns a dict with the following elements:
-               - "pred_logits": the classification logits (including no-object) for all queries.
-                                Shape= [batch_size x num_queries x num_classes]
-               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
-                               (center_x, center_y, width, height). These values are normalized in [0, 1],
-                               relative to the size of each individual image (disregarding possible padding).
-                               See PostProcess for information on how to retrieve the unnormalized bounding box.
-               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
-                                dictionnaries containing the two above keys for each decoder layer.
-        """
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         features, poss = self.backbone(samples)
@@ -197,8 +183,9 @@ class DINO(nn.Module):
         if self.dn_number > 0 or targets is not None:
             input_obj_labels, input_sub_labels, input_verb_labels, input_obj_boxes, input_sub_boxes, attn_mask, dn_meta = \
                 prepare_for_cdn(dn_args=(targets, self.dn_number, self.dn_label_noise_ratio, self.dn_box_noise_scale, samples.device),
-                                training=self.training, num_queries=self.num_queries, num_classes=self.num_classes, num_verb_classes=self.num_verb_classes,
-                                hidden_dim=self.hidden_dim, obj_label_enc=self.obj_label_enc, verb_label_enc=self.verb_label_enc)
+                                training=self.training, num_queries=self.num_queries, num_classes=self.num_classes,
+                                num_verb_classes=self.num_verb_classes, hidden_dim=self.hidden_dim,
+                                obj_label_enc=self.obj_label_enc, verb_label_enc=self.verb_label_enc)
         else:
             assert targets is None
             input_obj_labels = input_sub_labels = input_verb_labels = None
@@ -207,30 +194,43 @@ class DINO(nn.Module):
         # Transformer
         h_hs, h_ref, o_hs, o_ref, hoi, interm_class, interm_verb_class, interm_coord, interm_sub_coord = \
             self.transformer(srcs, masks, poss, input_obj_labels, input_sub_labels, input_verb_labels, input_obj_boxes, input_sub_boxes, attn_mask)
+        # in case num_obj=0 or num_verb=0, so the gradient doesn't exist, which unable to use distributed training
+        o_hs[0] += self.obj_label_enc.weight[0, 0] * 0.0
+        hoi[0] += self.verb_label_enc.weight[0, 0] * 0.0 + self.verb_label_enc.bias[0] * 0.0
 
         # Detector head
-        outputs_coord_list, outputs_sub_coord_list = [], []
+        outputs_coord, outputs_sub_coord = [], []
         for l, (h_r, h_w, h_h, o_r, o_w, o_h) in enumerate(zip(h_ref[:-1], self.sub_bbox_embed, h_hs, o_ref[:-1], self.bbox_embed, o_hs)):
             sub_coord = (h_w(h_h) + inverse_sigmoid(h_r)).sigmoid()
             obj_coord = (o_w(o_h) + inverse_sigmoid(o_r)).sigmoid()
-            outputs_sub_coord_list.append(sub_coord)
-            outputs_coord_list.append(obj_coord)
-        outputs_sub_coord_list, outputs_coord_list = torch.stack(outputs_sub_coord_list), torch.stack(outputs_coord_list)
+            outputs_sub_coord.append(sub_coord)
+            outputs_coord.append(obj_coord)
+        outputs_sub_coord, outputs_coord = torch.stack(outputs_sub_coord), torch.stack(outputs_coord)
         outputs_class = torch.stack([o_w(o_h) for o_w, o_h in zip(self.class_embed, o_hs)])
         outputs_verb_class = torch.stack([v_w(verb) for v_w, verb in zip(self.verb_class_embed, hoi)])
 
+        # knowledge distillation
+        if self.clip_loss:
+            outputs_fuse_embed = torch.stack([self.fuse_norm(self.sub_weight(hum[:, -self.num_queries:, :]) +
+                                                             self.obj_weight(obj[:, -self.num_queries:, :]) +
+                                                             self.hoi_weight(verb[:, -self.num_queries:, :]))
+                                              for hum, obj, verb in zip(h_hs, o_hs, hoi)])
+
         # DeNosing Postprocess
         if self.dn_number > 0 and dn_meta is not None:
-            outputs_class, outputs_verb_class, outputs_coord_list, outputs_sub_coord_list = \
-                dn_post_process(outputs_class, outputs_verb_class, outputs_coord_list, outputs_sub_coord_list,
+            outputs_class, outputs_verb_class, outputs_coord, outputs_sub_coord = \
+                dn_post_process(outputs_class, outputs_verb_class, outputs_coord, outputs_sub_coord,
                                 dn_meta, self.aux_loss, self._set_aux_loss)
 
         # Generate results
         out = {'pred_obj_logits': outputs_class[-1], 'pred_verb_logits': outputs_verb_class[-1],
-               'pred_sub_boxes': outputs_sub_coord_list[-1],'pred_obj_boxes': outputs_coord_list[-1]}
+               'pred_sub_boxes': outputs_sub_coord[-1], 'pred_obj_boxes': outputs_coord[-1],
+               'pred_feat': outputs_fuse_embed[-1]}
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_verb_class, outputs_coord_list, outputs_sub_coord_list)
-        if interm_class is not None:  # for encoder output
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_verb_class, outputs_coord, outputs_sub_coord)
+            for i in range(len(outputs_fuse_embed) - 1):
+                out['aux_outputs'][i]['pred_feat'] = outputs_fuse_embed[i]
+        if self.interm_loss:  # for encoder output
             out['interm_outputs'] = {'pred_obj_logits': interm_class, 'pred_verb_logits': interm_verb_class,
                                      'pred_sub_boxes': interm_sub_coord, 'pred_obj_boxes': interm_coord}
         out['dn_meta'] = dn_meta
@@ -261,39 +261,17 @@ class SetCriterion(nn.Module):
         self.focal_gamma = focal_gamma
         self.losses = losses
 
-    # def obj_labels(self, outputs, targets, indices, num_interactions):
-    #
-    #     src_logits = outputs['pred_obj_logits']
-    #
-    #     idx = self._get_src_permutation_idx(indices)
-    #     target_classes_o = torch.cat([t['obj_labels'][J] for t, (_, J) in zip(targets, indices)])
-    #     target_classes = torch.full(src_logits.shape[:2], self.num_obj_classes, dtype=torch.int64,
-    #                                 device=src_logits.device)
-    #     target_classes[idx] = target_classes_o
-    #
-    #     # loss_obj_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-    #     target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
-    #                                         dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
-    #     target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
-    #
-    #     target_classes_onehot = target_classes_onehot[:, :, :-1]
-    #
-    #     loss_obj_ce = ecm_loss(src_logits, target_classes_onehot, num_interactions, 'hico', 'obj')
-    #     losses = {'loss_obj_ce': loss_obj_ce}
-    #     return losses
-    #
-    # def verb_labels(self, outputs, targets, indices, num_interactions):
-    #
-    #     src_logits = outputs['pred_verb_logits']
-    #
-    #     idx = self._get_src_permutation_idx(indices)
-    #     target_classes_o = torch.cat([t['verb_labels'][J] for t, (_, J) in zip(targets, indices)])
-    #     target_classes = torch.zeros_like(src_logits)
-    #     target_classes[idx] = target_classes_o
-    #
-    #     loss_verb_ce = ecm_loss(src_logits, target_classes, num_interactions, 'hico', 'verb')
-    #     losses = {'loss_verb_ce': loss_verb_ce}
-    #     return losses
+        self.clip_model, _ = clip.load('ViT-B/32', device="cuda")
+
+    def loss_mimic(self, outputs, targets):
+        src_feats = torch.mean(outputs['pred_feat'], dim=1)
+        img_inputs = torch.cat([t['clip_inputs'].unsqueeze(0) for t in targets])
+        with torch.no_grad():
+            img_feats = self.clip_model.encode_image(img_inputs)
+
+        loss_feat_mimic = F.l1_loss(src_feats, img_feats)
+        losses = {'loss_feat': loss_feat_mimic}
+        return losses
 
     def loss_obj_labels(self, outputs, targets, indices, num_interactions):
         src_logits = outputs['pred_obj_logits']
@@ -303,7 +281,6 @@ class SetCriterion(nn.Module):
         target_classes = torch.full(src_logits.shape[:2], self.num_obj_classes, dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
 
-        # loss_obj_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
                                             dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
@@ -469,6 +446,15 @@ class SetCriterion(nn.Module):
                 l_dict = {k + f'_interm': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
+        # knowledge distillation
+        if 'pred_feat' in outputs:
+            l_dict = self.loss_mimic(outputs, targets)
+            losses.update(l_dict)
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                l_dict = self.loss_mimic(aux_outputs, targets)
+                l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
+                losses.update(l_dict)
+
         return losses
 
     def prep_for_dn(self, dn_meta):
@@ -496,13 +482,10 @@ class PostProcess(nn.Module):
         assert target_sizes.shape[1] == 2
 
         obj_prob = F.softmax(out_obj_logits, -1)
-        # obj_scores, obj_labels = obj_prob[..., :-1].max(-1)
         verb_scores = out_verb_logits.sigmoid()
 
         # NMS
         num_verb_classes = verb_scores.shape[-1]
-        # top 100
-        # obj_prob_class_all = obj_prob[:, :, :-1] if self.no_obj else obj_prob
         num_obj_classes = obj_prob.shape[-1]
 
         topk_values, topk_indexes = torch.topk(obj_prob.flatten(1), self.nms_number, dim=1)
@@ -530,7 +513,6 @@ class PostProcess(nn.Module):
             results.append({'labels': l.to('cpu'), 'boxes': b.to('cpu')})
 
             vs = vs * os.unsqueeze(1)
-
             ids = torch.arange(b.shape[0])
 
             results[-1].update({'verb_scores': vs.to('cpu'), 'sub_ids': ids[:ids.shape[0] // 2],
@@ -550,7 +532,9 @@ def build_dino(args):
         num_classes=args.num_obj_classes,
         num_verb_classes=args.num_verb_classes,
         num_queries=args.num_queries,
-        aux_loss=True,
+        aux_loss=args.aux_loss,
+        interm_loss=args.interm_loss,
+        clip_loss=args.clip_loss,
         num_feature_levels=args.num_feature_levels,
         dec_pred_class_embed_share=args.dec_pred_class_embed_share,
         dec_pred_bbox_embed_share=args.dec_pred_bbox_embed_share,
@@ -582,20 +566,23 @@ def build_dino(args):
         weight_dict['loss_obj_giou_dn'] = args.giou_loss_coef
     clean_weight_dict = copy.deepcopy(weight_dict)
 
-    # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update({k + f'_{i}': v for k, v in clean_weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    interm_weight_dict = {}
-    _coeff_weight_dict = {'loss_obj_ce': 1.0, 'loss_verb_ce': 1.0, 'loss_sub_bbox': 1.0,
-                          'loss_obj_bbox': 1.0, 'loss_sub_giou': 1.0, 'loss_obj_giou': 1.0}
+    if args.interm_loss:
+        interm_weight_dict = {}
+        interm_weight_dict.update({k + f'_interm': v * args.interm_loss_coef for k, v in clean_weight_dict_wo_dn.items()})
+        weight_dict.update(interm_weight_dict)
 
-    interm_loss_coef = args.interm_loss_coef
-    interm_weight_dict.update({k + f'_interm': v * interm_loss_coef * _coeff_weight_dict[k] for k, v in clean_weight_dict_wo_dn.items()})
-    weight_dict.update(interm_weight_dict)
+    # knowledge distillation
+    if args.clip_loss:
+        mimic_weight_dict = {'loss_feat': args.clip_loss_coef}
+        for i in range(args.dec_layers - 1):
+            mimic_weight_dict.update({k + f'_{i}': v for k, v in mimic_weight_dict.items()})
+        weight_dict.update(mimic_weight_dict)
 
     losses = ['obj_labels', 'verb_labels', 'sub_obj_boxes']
     criterion = SetCriterion(args.num_obj_classes, args.num_queries, args.num_verb_classes, matcher=matcher,

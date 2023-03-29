@@ -32,12 +32,14 @@ set_cost_giou = 1.0
 
 # Loss
 aux_loss = True
+interm_loss = True
+clip_loss = True
 obj_loss_coef = 1.0
 verb_loss_coef = 1.0
 bbox_loss_coef = 2.5
 giou_loss_coef = 1.0
 interm_loss_coef = 1.0
-no_interm_box_loss = False
+clip_loss_coef = 20
 focal_alpha = 0.25
 focal_gamma = 2.0
 

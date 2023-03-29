@@ -4,3 +4,4 @@ _base_ = ['./_base_/dataset.py',
 
 backbone = 'resnet50'
 use_checkpoint = False
+pretrained = ""
