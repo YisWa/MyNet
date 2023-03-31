@@ -1,16 +1,3 @@
-# ------------------------------------------------------------------------
-# DINO
-# Copyright (c) 2022 IDEA. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
-# Conditional DETR Transformer class.
-# Copyright (c) 2021 Microsoft. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
-# Modified from DETR (https://github.com/facebookresearch/detr)
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
-# ------------------------------------------------------------------------
-
 import copy
 from typing import Optional
 
@@ -45,11 +32,8 @@ class DeformableTransformer(nn.Module):
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))  # for lvl_pos_embed
         self.tgt_embed = nn.Embedding(self.num_queries, d_model)  # decoder embedding
-        nn.init.normal_(self.tgt_embed.weight.data)
         self.sub_tgt_embed = nn.Embedding(self.num_queries, d_model)  # decoder embedding
-        nn.init.normal_(self.sub_tgt_embed.weight.data)
         self.hoi_tgt_embed = nn.Embedding(self.num_queries, d_model)  # decoder embedding
-        nn.init.normal_(self.hoi_tgt_embed.weight.data)
 
         # anchor selection at the output of encoder
         self.enc_output = nn.Linear(d_model, d_model)
@@ -72,6 +56,10 @@ class DeformableTransformer(nn.Module):
         if self.num_feature_levels > 1 and self.level_embed is not None:
             nn.init.normal_(self.level_embed)
 
+        nn.init.normal_(self.tgt_embed.weight.data)
+        nn.init.normal_(self.sub_tgt_embed.weight.data)
+        nn.init.normal_(self.hoi_tgt_embed.weight.data)
+
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
         valid_H = torch.sum(~mask[:, :, 0], 1)
@@ -82,15 +70,7 @@ class DeformableTransformer(nn.Module):
         return valid_ratio
 
     def forward(self, srcs, masks, poss, tgt, sub_tgt, hoi_tgt, refpoint_embed, sub_refpoint_embed, attn_mask=None):
-        """
-        Input:
-            - srcs: List of multi features [bs, ci, hi, wi]
-            - masks: List of multi masks [bs, hi, wi]
-            - refpoint_embed: [bs, num_dn, 4]. None in infer
-            - pos_embeds: List of multi pos embeds [bs, ci, hi, wi]
-            - tgt: [bs, num_dn, d_model]. None in infer
-            
-        """
+
         # prepare input for encoder
         src_flatten = []
         mask_flatten = []
@@ -145,28 +125,28 @@ class DeformableTransformer(nn.Module):
 
         # gather tgt: Static_Content_Queries
         tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # bs, nq, d_model
-        sub_tgt_ = self.sub_tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # TODO for human init content
-        hoi_tgt_ = self.hoi_tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # TODO for hoi init content
+        sub_tgt_ = self.sub_tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)
+        hoi_tgt_ = self.hoi_tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)
 
         if refpoint_embed is not None:  # for DN
             refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_], dim=1)  # (bs, dn+nq, 4) unsigmoid
             tgt = torch.cat([tgt, tgt_], dim=1)  # (bs, dn+nq, d_model)
-            sub_refpoint_embed = torch.cat([sub_refpoint_embed, sub_refpoint_embed_], dim=1)  # TODO for concat human bbox unsigmoid
-            sub_tgt = torch.cat([sub_tgt, sub_tgt_], dim=1)  # TODO for concat human init content
-            hoi_tgt = torch.cat([hoi_tgt, hoi_tgt_], dim=1)  # TODO for concat hoi init content
+            sub_refpoint_embed = torch.cat([sub_refpoint_embed, sub_refpoint_embed_], dim=1)
+            sub_tgt = torch.cat([sub_tgt, sub_tgt_], dim=1)
+            hoi_tgt = torch.cat([hoi_tgt, hoi_tgt_], dim=1)
         else:
             refpoint_embed, tgt = refpoint_embed_, tgt_
-            sub_refpoint_embed, sub_tgt, hoi_tgt = sub_refpoint_embed_, sub_tgt_, hoi_tgt_  # TODO for concat human & hoi init content
+            sub_refpoint_embed, sub_tgt, hoi_tgt = sub_refpoint_embed_, sub_tgt_, hoi_tgt_
 
         # Decoder
         h_hs, h_ref, o_hs, o_ref, hoi = self.decoder(  # (n_dec, bs, nq, d_model)    (n_dec+1, bs, bq, 4) sigmoid
                 tgt=tgt.transpose(0, 1),  # dn+nq, bs, d_model
-                sub_tgt=sub_tgt.transpose(0, 1),  # TODO for human content
-                hoi=hoi_tgt.transpose(0, 1),  # TODO for hoi content
+                sub_tgt=sub_tgt.transpose(0, 1),
+                hoi=hoi_tgt.transpose(0, 1),
                 memory=memory.transpose(0, 1),  # sum(hi*wi), bs, d_model
                 memory_key_padding_mask=mask_flatten,  # bs, sum(hi*wi)  MASK
-                refpoints_unsigmoid=refpoint_embed.transpose(0, 1),  # dn+nq, bs, 4
-                sub_refpoints_unsigmoid=sub_refpoint_embed.transpose(0, 1),  # TODO for human bbox
+                refpoints=refpoint_embed.transpose(0, 1),  # dn+nq, bs, 4
+                sub_refpoints=sub_refpoint_embed.transpose(0, 1),
                 level_start_index=level_start_index,  # num_levels
                 spatial_shapes=spatial_shapes,  # num_levels, 2
                 valid_ratios=valid_ratios,  # bs, num_levels, 2
@@ -198,19 +178,7 @@ class TransformerEncoder(nn.Module):
         return reference_points
 
     def forward(self, src, pos, spatial_shapes, level_start_index, valid_ratios, key_padding_mask):
-        """
-        Input:
-            - src: [bs, sum(hi*wi), 256]
-            - pos: pos embed for src. [bs, sum(hi*wi), 256]
-            - spatial_shapes: h,w of each level [num_level, 2]
-            - level_start_index: [num_level] start point of level in sum(hi*wi).
-            - valid_ratios: [bs, num_level, 2]
-            - key_padding_mask: [bs, sum(hi*wi)]
-        Intermedia:
-            - reference_points: [bs, sum(hi*wi), num_level, 2]
-        Outpus: 
-            - output: [bs, sum(hi*wi), 256]
-        """
+
         output = src
         # preparation and reshape
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)  # (bs, sum(hi*wi), level, 2)
@@ -236,7 +204,6 @@ class TransformerDecoder(nn.Module):
 
         self.ref_point_head = MLP(query_dim // 2 * d_model, d_model, d_model, 2)
         self.sub_ref_point_head = MLP(query_dim // 2 * d_model, d_model, d_model, 2)
-        # self.hoi_ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
 
         fuser = Fuser(d_model, activation="relu")
         self.fusers = _get_clones(fuser, num_layers, layer_share=False)
@@ -244,28 +211,13 @@ class TransformerDecoder(nn.Module):
         self.bbox_embed = None
         self.sub_bbox_embed = None
 
-    def forward(self, tgt, sub_tgt, hoi, memory,  # 1100, bs, d_model   # sum(hi*wi), bs, d_model
-                tgt_mask: Optional[Tensor] = None,  # dn+nq, dn+nq
-                memory_key_padding_mask: Optional[Tensor] = None,  # bs, sum(hi*wi)
-                refpoints_unsigmoid: Optional[Tensor] = None, # 1100, bs, 4
-                sub_refpoints_unsigmoid: Optional[Tensor] = None,  # 1100, bs, 4
-                # for memory
-                level_start_index: Optional[Tensor] = None,  # num_levels
-                spatial_shapes: Optional[Tensor] = None,  # num_levels, 2
-                valid_ratios: Optional[Tensor] = None,  # bs, num_levels, 2
-                ):
-        """
-        Input:
-            - tgt: nq, bs, d_model
-            - memory: hw, bs, d_model
-            - pos: hw, bs, d_model
-            - refpoints_unsigmoid: nq, bs, 2/4
-            - valid_ratios/spatial_shapes: bs, nlevel, 2
-        """
+    def forward(self, tgt, sub_tgt, hoi, memory, tgt_mask, memory_key_padding_mask, refpoints, sub_refpoints,
+                level_start_index, spatial_shapes, valid_ratios):
+
         output, sub_output, hoi_output = tgt, sub_tgt, hoi
 
         intermediate, sub_intermediate, hoi_intermediate = [], [], []
-        reference_points, sub_reference_points = refpoints_unsigmoid.sigmoid(), sub_refpoints_unsigmoid.sigmoid()  # dn+nq, bs, 4
+        reference_points, sub_reference_points = refpoints.sigmoid(), sub_refpoints.sigmoid()  # dn+nq, bs, 4
         ref_points, sub_ref_points = [reference_points], [sub_reference_points]
 
         for layer_id, (layer, sub_layer, hoi_layer, fuser) in enumerate(zip(self.layers, self.sub_layers, self.hoi_layers, self.fusers)):
@@ -296,15 +248,9 @@ class TransformerDecoder(nn.Module):
             hoi_reference_points = box_union(new_reference_points, sub_new_reference_points)
             hoi_reference_points_input = hoi_reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[None, :]
 
-            # reference_points_input = new_reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[None, :]
-            # query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :]) # dn+nq, bs, d_model*2
-            # sub_reference_points_input = sub_new_reference_points[:, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[None, :]  # dn+nq, bs, num_levels, 4
-            # sub_query_sine_embed = gen_sineembed_for_position(sub_reference_points_input[:, :, 0, :])  # dn+nq, bs, d_model*2
-            # hoi_query_pos = self.hoi_ref_point_head(torch.cat([output, sub_output], dim=-1))  # dn+nq, bs, d_model
-
             hoi_fused_pos = fuser.ternary_fusion(output, new_reference_points, sub_output, sub_new_reference_points)
 
-            hoi_output = hoi_layer(hoi_output, hoi_fused_pos, hoi_reference_points_input, memory, memory_key_padding_mask,  # TODO use hoi_fused_output or hoi_query_pos
+            hoi_output = hoi_layer(hoi_output, hoi_fused_pos, hoi_reference_points_input, memory, memory_key_padding_mask,
                                    level_start_index, spatial_shapes, tgt_mask)
 
             reference_points, sub_reference_points = new_reference_points.detach(), sub_new_reference_points.detach()  # dn+nq, bs, 4

@@ -1,9 +1,3 @@
-# ------------------------------------------------------------------------
-# DINO
-# Copyright (c) 2022 IDEA. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
-
 import torch
 from torch import nn, Tensor
 
@@ -164,31 +158,3 @@ def gen_sineembed_for_position(pos_tensor):
     else:
         raise ValueError("Unknown pos_tensor shape(-1):{}".format(pos_tensor.size(-1)))
     return pos
-
-
-def ecm_loss(inputs, targets, num_interactions, datasets, types):
-    B, N, C = inputs.shape
-    inputs = inputs.sigmoid()
-    with open('sample_number.pkl', 'rb') as f:
-        data = pickle.load(f)
-    sample_n = torch.tensor(data[f'{datasets}_{types}']).float().to(inputs.device)
-
-    n_pos = sample_n
-    n_neg = sample_n.sum() - sample_n
-    pos_w = (n_neg.pow(1 / 4) / (n_pos.pow(1 / 4) + n_neg.pow(1 / 4))).pow(-1).log()
-    neg_w = (n_pos.pow(1 / 4) / (n_pos.pow(1 / 4) + n_neg.pow(1 / 4))).pow(-1).log()
-    pos_w = pos_w.view(1, -1).expand(B, N, C)
-    neg_w = neg_w.view(1, -1).expand(B, N, C)
-
-    score_exp_pos = (inputs + pos_w).exp()
-    score_exp_neg = (-inputs + neg_w).exp()
-    pred_pos = score_exp_pos / (score_exp_pos + score_exp_neg)
-    pred_neg = score_exp_neg / (score_exp_pos + score_exp_neg)
-    loss_cls = - (pred_pos.log() * targets + pred_neg.log() * (1 - targets))
-
-    a = n_neg / n_pos
-    cls_weight = a * ((1 + a) / a).log()
-
-    loss_cls = (loss_cls * cls_weight).sum() / (B * N)
-
-    return loss_cls

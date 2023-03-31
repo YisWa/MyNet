@@ -1,7 +1,3 @@
-# ------------------------------------------------------------------------
-# Copyright (c) Hitachi, Ltd. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
 from pathlib import Path
 from PIL import Image
 import json
@@ -9,9 +5,10 @@ import numpy as np
 
 import torch
 import torch.utils.data
-import torchvision
+import clip
 
 import datasets.transforms as T
+
 
 class VCOCO(torch.utils.data.Dataset):
 
@@ -21,7 +18,6 @@ class VCOCO(torch.utils.data.Dataset):
         with open(anno_file, 'r') as f:
             self.annotations = json.load(f)
         self._transforms = transforms
-
         self.num_queries = num_queries
 
         self._valid_obj_ids = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13,
@@ -33,6 +29,8 @@ class VCOCO(torch.utils.data.Dataset):
                                72, 73, 74, 75, 76, 77, 78, 79, 80, 81,
                                82, 84, 85, 86, 87, 88, 89, 90)
         self._valid_verb_ids = range(29)
+
+        _, self.clip_preprocess = clip.load('ViT-B/32', device="cpu")
 
     def __len__(self):
         return len(self.annotations)
@@ -73,7 +71,10 @@ class VCOCO(torch.utils.data.Dataset):
             target['area'] = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
 
             if self._transforms is not None:
-                img, target = self._transforms(img, target)
+                img_0, target_0 = self._transforms[0](img, target)
+                img, target = self._transforms[1](img_0, target_0)
+            clip_inputs = self.clip_preprocess(img_0)
+            target['clip_inputs'] = clip_inputs
 
             kept_box_indices = [label[0] for label in target['labels']]
 
@@ -145,7 +146,7 @@ def make_vcoco_transforms(image_set):
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
 
     if image_set == 'train':
-        return T.Compose([
+        return [T.Compose([
             T.RandomHorizontalFlip(),
             T.ColorJitter(.4, .4, .4),
             T.RandomSelect(
@@ -154,10 +155,10 @@ def make_vcoco_transforms(image_set):
                     T.RandomResize([400, 500, 600]),
                     T.RandomSizeCrop(384, 600),
                     T.RandomResize(scales, max_size=1333),
-                ])
-            ),
-            normalize,
-        ])
+                ]))]
+        ),
+            normalize
+        ]
 
     if image_set == 'val':
         return T.Compose([

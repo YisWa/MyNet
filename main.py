@@ -1,19 +1,15 @@
-# Copyright (c) 2022 IDEA. All Rights Reserved.
-# ------------------------------------------------------------------------
 import argparse
 import datetime
 import json
 import random
 import time
 from pathlib import Path
-import os, sys
 import numpy as np
 
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
-from util.slconfig import DictAction, SLConfig
-from util.get_param_dicts import get_param_dict
+from util.slconfig import SLConfig
 import util.misc as utils
 
 from datasets import build_dataset
@@ -60,9 +56,13 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
         model_without_ddp = model.module
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    param_dicts = get_param_dict(args, model_without_ddp)
+    param_dicts = [
+        {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and p.requires_grad]},
+        {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and p.requires_grad],
+         "lr": args.lr_backbone}
+    ]
 
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)

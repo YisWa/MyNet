@@ -1,2 +1,3 @@
-/.idea/
-/datasets/data_stats.py
+.idea
+datasets/data_stats.py
+models/convnext.py

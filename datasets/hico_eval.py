@@ -1,8 +1,3 @@
-# ------------------------------------------------------------------------
-# QAHOI
-# Copyright (c) 2021 Junwen Chen. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
 import numpy as np
 import os
 import json
@@ -349,7 +344,6 @@ class HICOEvaluator():
         # print(f'AP:{ap}')
         return (ap, hoi_id)
 
-    # Refer to CDN: https://github.com/YueLiao/CDN/blob/main/datasets/hico_eval.py
     def triplet_nms_filter(self, preds):
         preds_filtered = []
         for img_preds in preds:
@@ -383,7 +377,6 @@ class HICOEvaluator():
 
         return preds_filtered
 
-    # Modified from CDN: https://github.com/YueLiao/CDN/blob/main/datasets/hico_eval.py
     def pairwise_nms(self, subs, objs, scores):
         sx1, sy1, sx2, sy2 = subs[:, 0], subs[:, 1], subs[:, 2], subs[:, 3]
         ox1, oy1, ox2, oy2 = objs[:, 0], objs[:, 1], objs[:, 2], objs[:, 3]
@@ -423,12 +416,3 @@ class HICOEvaluator():
 
             order = order[inds + 1]
         return keep_inds
-
-
-if __name__ == "__main__":
-    import torch
-
-    preds = torch.load("../preds.pt")
-    gts = torch.load("../gts.pt")
-    evaluator = HICOEvaluator(preds, gts, "../data/hico_20160224_det/", "../", -1)
-    evaluator.evaluation_extra()

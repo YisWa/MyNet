@@ -1,18 +1,3 @@
-# ------------------------------------------------------------------------
-# DINO
-# Copyright (c) 2022 IDEA. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
-# Conditional DETR model and criterion classes.
-# Copyright (c) 2021 Microsoft. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
-# ------------------------------------------------------------------------
-# Modified from DETR (https://github.com/facebookresearch/detr)
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
-# ------------------------------------------------------------------------
-# Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
-# Copyright (c) 2020 SenseTime. All Rights Reserved.
-# ------------------------------------------------------------------------
 import copy
 import math
 from typing import List
@@ -225,11 +210,11 @@ class DINO(nn.Module):
         # Generate results
         out = {'pred_obj_logits': outputs_class[-1], 'pred_verb_logits': outputs_verb_class[-1],
                'pred_sub_boxes': outputs_sub_coord[-1], 'pred_obj_boxes': outputs_coord[-1],
-               'pred_feat': outputs_fuse_embed[-1]}
+               'pred_feat': outputs_fuse_embed[-1] if self.clip_loss else None}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_verb_class, outputs_coord, outputs_sub_coord)
             for i in range(len(outputs_fuse_embed) - 1):
-                out['aux_outputs'][i]['pred_feat'] = outputs_fuse_embed[i]
+                out['aux_outputs'][i]['pred_feat'] = outputs_fuse_embed[i] if self.clip_loss else None
         if self.interm_loss:  # for encoder output
             out['interm_outputs'] = {'pred_obj_logits': interm_class, 'pred_verb_logits': interm_verb_class,
                                      'pred_sub_boxes': interm_sub_coord, 'pred_obj_boxes': interm_coord}
